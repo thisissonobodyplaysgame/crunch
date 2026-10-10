@@ -1,0 +1,1180 @@
+<html lang="en"><head>
+<meta charset="utf-8">
+<base href="../../">
+<script>/* serum static loader — injected FIRST into the <head> of the shell AND every module
+ * on the static (s3/gcs) build. adapted from infamous's proven backend-loader.
+ * jobs:
+ *   1. <base> = the bucket sub-path (/<bucket>/) so relative asset urls resolve to the
+ *      bucket root from the shell AND from nested module iframes.
+ *   2. route root-absolute paths at RUNTIME: first segment is a real bucket dir → bucket;
+ *      the dynamic endpoints (/_o /api /w /jsd) → the discovered mirror. patches fetch,
+ *      XHR, WebSocket, .src/.href setters, setAttribute, a MutationObserver (innerHTML +
+ *      css url()), and serviceWorker.register.
+ *   3. pick a reachable mirror from the pool (ping + failover), never redirect/iframe.
+ * build injects __POOL_FALLBACK__ + __STATIC_ROOTS__. */
+(function () {
+  // ---- 1. base = bucket sub-path (first path segment). set BEFORE the parser hits any
+  //         <script src>/<link href>, so relative urls resolve to the bucket root. ----
+  var seg1root = '/' + (location.pathname.split('/')[1] || '') + '/';
+  var BASE = seg1root === '//' ? '/' : seg1root;
+  window.__SERUM_TP_BASE = BASE;   // scramjet/proxy transport paths resolve under this
+  // the build injects a STATIC relative <base> before this script (so the preload
+  // scanner resolves module asset urls correctly). only write one at runtime if that
+  // static tag is somehow absent — a document.write'd base lands too late for the
+  // preload scanner, which is what 404'd module assets before.
+  try { if (!document.querySelector('base')) document.write('<base href="' + location.origin + BASE + '">'); } catch (e) {}
+
+  // ---- pool ----
+  function _dec(b) { try { var k = 'S3rum-p00l-x0r-k3y-2026', s = atob(b), o = ''; for (var i = 0; i < s.length; i++) o += String.fromCharCode(s.charCodeAt(i) ^ k.charCodeAt(i % k.length)); return JSON.parse(o); } catch (e) { return null; } }
+  var FALLBACK = _dec("CBEaARldAwofQ04RQgBYGFESG14eQloyXRcBXhheU18BD1QSGlkfQwoXHR9WRDpVBhIdVRgeXRVeD1UWSAVbFl5GHkpPKRFeVwVZBEBDVgJXVh5EBUdOT11BHF8hQgEcHlkVXVEfAxZVBg9HERFZRkBBDHwcFgcESwRKCQVdVlEQXwpHHE4cU11bfVEAV0EPGEREHF5CH11CBUoBR1BISxggUhkcCVgdUUIbTBZRXE4EXldDQhIeFDtHBgUeF18fVQFPHUJBRBxZV0pbQ1daNkFcFgJAXkRCTgFaWAZZG0BDAh1AW042XwcFVR5eW1gFQBpRGkwPRgtdR14cVTxeXBsdD1wSWBhZCENIAkRXC0RUREZCawFcFgVEE1tVAkYRXB5IGR0aQl8Sbw==") || [];
+  var STATIC_ROOTS = {"active":1,"anime-vendor":1,"apple-touch-icon.png":1,"assets":1,"auth-vendor":1,"bm":1,"bm-vendor":1,"browser-vendor":1,"code-vendor":1,"core":1,"ep":1,"ep-vendor":1,"favicon.ico":1,"favicon.png":1,"favicon.svg":1,"index.html":1,"lc":1,"lc-vendor":1,"modules":1,"shell":1,"study":1,"study-vendor":1,"uv":1,"uv-vendor":1};   // top-level bucket dirs/files → served from bucket
+  var MARKER = 'ok';
+  var PING_MS = 2800;
+  function norm(b) { return String(b || '').replace(/\/+$/, ''); }
+
+  var saved = null; try { saved = sessionStorage.getItem('__sb'); } catch (e) {}
+  var primary = norm(saved || FALLBACK[0] || '');
+  if (!primary) return;   // no backend to route to; app stays broken but page doesn't error
+
+  // globals the app / proxy read
+  try { Object.defineProperty(window, '__SERUM_ORIGIN', { configurable: true, get: function () { return primary; }, set: function () {} }); } catch (e) { window.__SERUM_ORIGIN = primary; }
+  // LOCK the wisp url to the mirror — the app's config.js otherwise resets it to
+  // location.origin (the bucket), which has no wisp server. no-op setter wins.
+  try { Object.defineProperty(window, 'SERUM_WISP', { configurable: true, get: function () { return primary.replace(/^http/i, 'ws') + '/w/'; }, set: function () {} }); }
+  catch (e) { window.SERUM_WISP = primary.replace(/^http/i, 'ws') + '/w/'; }
+  var WSBK = primary.replace(/^http/i, 'ws');
+  var _f = window.fetch;
+
+  // ---- 2. path routing ----
+  // sibling buckets we own on the SAME host (game assets) — full absolute urls to
+  // these must pass through untouched, not get routed to the backend.
+  var PASSTHROUGH = { 'studyhub-content': 1 };
+  function seg1(p) { var s = p.split('/')[1]; return s ? s.split(/[?#]/)[0] : ''; }
+  function rw(u) {
+    if (typeof u !== 'string' || !u) return u;
+    if (/^(https?:|wss?:|\/\/|data:|blob:)/i.test(u)) {
+      try {
+        var x = new URL(u, location.href);
+        if (x.host === location.host) {
+          if (x.pathname.indexOf(BASE) === 0) return u;                              // already this bucket
+          if (PASSTHROUGH[seg1(x.pathname)]) return u;                                // sibling asset bucket → leave
+          return (STATIC_ROOTS[seg1(x.pathname)] ? location.origin + BASE + x.pathname.slice(1) : primary + x.pathname) + x.search;
+        }
+      } catch (e) {}
+      return u;                                                                       // external absolute → leave (supabase, etc.)
+    }
+    if (u.charAt(0) !== '/') return u;                                                 // relative → resolves under <base>
+    if (u.indexOf(BASE) === 0) return u;                                              // already under bucket
+    return STATIC_ROOTS[seg1(u)] ? BASE + u.slice(1) : primary + u;                   // bucket static vs backend endpoint
+  }
+  // like rw() but STATIC assets go to the MIRROR too (not the paid bucket). used for
+  // JS-initiated resource loads (.src/.href) — wallpapers, vendor bundles, scripts —
+  // so the s3/gcs bucket only serves the tiny bootstrap shell + first-paint. the
+  // mirror's bandwidth (ovh = included, bunny = cheap) carries the heavy bytes.
+  function rwB(u) {
+    if (typeof u !== 'string' || !u) return u;
+    if (/^(https?:|wss?:|\/\/|data:|blob:)/i.test(u)) {
+      try {
+        var x = new URL(u, location.href);
+        if (x.host === location.host) {
+          if (PASSTHROUGH[seg1(x.pathname)]) return u;
+          var pn = x.pathname.indexOf(BASE) === 0 ? '/' + x.pathname.slice(BASE.length) : x.pathname;
+          return primary + pn + x.search;
+        }
+      } catch (e) {}
+      return u;
+    }
+    if (u.charAt(0) === '/') return primary + (u.indexOf(BASE) === 0 ? '/' + u.slice(BASE.length) : u);
+    var rel = u.replace(/^\.?\//, '');
+    return STATIC_ROOTS[seg1('/' + rel)] ? primary + '/' + rel : u;                   // static relative → mirror
+  }
+  function rwWs(u) {
+    if (typeof u !== 'string') return u;
+    try { var x = new URL(u, location.href); if (x.host === location.host && /^\/(w|ws|wisp)(\/|$)/.test(x.pathname)) return WSBK + x.pathname + x.search; } catch (e) {}
+    if (u.charAt(0) === '/' && /^\/(w|ws|wisp)(\/|$)/.test(u)) return WSBK + u;
+    return u;
+  }
+
+  // WebSocket → repoint /w /ws /wisp to backend
+  var _WS = window.WebSocket;
+  function PWS(url, p) { return arguments.length > 1 ? new _WS(rwWs(url), p) : new _WS(rwWs(url)); }
+  PWS.prototype = _WS.prototype;
+  ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) { try { PWS[k] = _WS[k]; } catch (e) {} });
+  window.WebSocket = PWS;
+
+  // .src/.href setters + setAttribute
+  function patch(proto, prop, fn) {
+    try { var d = Object.getOwnPropertyDescriptor(proto, prop); if (!d || !d.set) return;
+      Object.defineProperty(proto, prop, { configurable: true, enumerable: d.enumerable, get: d.get, set: function (v) { d.set.call(this, fn(v)); } });
+    } catch (e) {}
+  }
+  // media/script/img/link → mirror (rwB). IFRAMES (modules) stay on the bucket (rw) so
+  // they're SAME-ORIGIN to the shell (postMessage + theme/contentDocument sync).
+  patch(HTMLImageElement.prototype, 'src', rwB); patch(HTMLMediaElement.prototype, 'src', rwB);
+  patch(HTMLScriptElement.prototype, 'src', rwB); patch(HTMLIFrameElement.prototype, 'src', rw);
+  patch(HTMLLinkElement.prototype, 'href', rwB);
+  var _sa = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function (n, v) { if ((n === 'src' || n === 'href') && typeof v === 'string') v = (this.tagName === 'IFRAME' ? rw(v) : rwB(v)); return _sa.call(this, n, v); };
+
+  // MutationObserver — innerHTML-set src + css background url(/..)
+  function fixEl(el) {
+    if (!el || el.nodeType !== 1) return;
+    var t = el.tagName;
+    if (t === 'IMG' || t === 'IFRAME' || t === 'SOURCE' || t === 'SCRIPT' || t === 'VIDEO' || t === 'AUDIO' || t === 'LINK') {
+      var a = (t === 'LINK') ? 'href' : 'src', s = el.getAttribute(a); if (s) { var n = rw(s); if (n !== s) _sa.call(el, a, n); }
+    }
+    var st = el.getAttribute && el.getAttribute('style');
+    if (st && st.indexOf('url(') !== -1) { var nst = st.replace(/url\((['"]?)(\/[^)'"]+)\1\)/g, function (m, q, u) { return 'url(' + q + rw(u) + q + ')'; }); if (nst !== st) el.setAttribute('style', nst); }
+  }
+  try {
+    var mo = new MutationObserver(function (muts) {
+      for (var i = 0; i < muts.length; i++) { var m = muts[i];
+        if (m.type === 'attributes') { fixEl(m.target); continue; }
+        for (var j = 0; j < m.addedNodes.length; j++) { var nd = m.addedNodes[j]; fixEl(nd);
+          if (nd.querySelectorAll) { var all = nd.querySelectorAll('img,iframe,source,script,link,[style]'); for (var k = 0; k < all.length; k++) fixEl(all[k]); } }
+      }
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'href', 'style'] });
+  } catch (e) {}
+
+  // serviceWorker.register → bucket-prefix the script + scope
+  try {
+    var _swc = navigator.serviceWorker;
+    if (_swc && _swc.register) { var _reg = _swc.register.bind(_swc);
+      _swc.register = function (script, opts) {
+        try { if (typeof script === 'string') script = rw(script); } catch (e) {}
+        try { if (opts && typeof opts.scope === 'string') { opts = Object.assign({}, opts); opts.scope = rw(opts.scope); } } catch (e) {}
+        return _reg(script, opts);
+      };
+    }
+  } catch (e) {}
+
+  // fetch + XHR → /_o /api /w /jsd to backend
+  window.fetch = function (u, o) { try { if (typeof u === 'string') u = rw(u); else if (u && u.url) u = new Request(rw(u.url), u); } catch (e) {} return _f.call(this, u, o); };
+  try {
+    var _open = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (m, u) { try { if (typeof u === 'string') { u = rw(u); arguments[1] = u; } } catch (e) {} return _open.apply(this, arguments); };
+  } catch (e) {}
+  // navigator.sendBeacon → /_o /api to the backend (the analytics beacon uses it; it's
+  // not covered by the fetch/XHR patches, so without this it hits the bucket → 400).
+  try {
+    if (navigator.sendBeacon) {
+      var _sb = navigator.sendBeacon.bind(navigator);
+      navigator.sendBeacon = function (url, data) { try { if (typeof url === 'string') url = rw(url); } catch (e) {} return arguments.length > 1 ? _sb(url, data) : _sb(url); };
+    }
+  } catch (e) {}
+
+  // ---- 3. background: if primary blocked, ping the pool + reload with a live mirror ----
+  function ping(base) {
+    return new Promise(function (res, rej) {
+      var c = new AbortController(), t = setTimeout(function () { c.abort(); rej(); }, PING_MS);
+      _f.call(window, norm(base) + '/_o/health', { signal: c.signal, cache: 'no-store', mode: 'cors' })
+        .then(function (r) { clearTimeout(t); r && r.ok ? res(norm(base)) : rej(); })
+        .catch(function () { clearTimeout(t); rej(); });
+    });
+  }
+  function notifyNoBackend() {
+    if (document.getElementById('__nb_pop')) return;
+    var d = document.createElement('div'); d.id = '__nb_pop';
+    d.style.cssText = 'position:fixed;inset:0;z-index:2147483600;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.62);font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;color:#ccc';
+    d.innerHTML = '<div style="width:360px;max-width:88vw;background:#151515;border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:22px;text-align:center"><h3 style="margin:0 0 8px;color:#fff;font-size:16px">Couldn’t reach a server</h3><p style="margin:0 0 16px;color:#999;font-size:13px">Your network blocked every connection we tried. Try a different network or retry.</p><button onclick="(function(){try{sessionStorage.removeItem(\'__sb\')}catch(e){}location.reload()})()" style="padding:9px 16px;border-radius:8px;border:0;background:#fff;color:#111;font-weight:600;cursor:pointer">Retry</button></div>';
+    (document.body || document.documentElement).appendChild(d);
+  }
+  function tryPool(list) {
+    var rest = (list || []).map(norm).filter(function (b) { return b && b !== primary; });
+    if (!rest.length) { notifyNoBackend(); return; }
+    // shuffle so we don't stampede the same mirror
+    for (var i = rest.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)), t = rest[i]; rest[i] = rest[j]; rest[j] = t; }
+    var done = false, settled = 0;
+    rest.slice(0, 30).forEach(function (b) {
+      ping(b).then(function (ok) { if (done) return; done = true; try { sessionStorage.setItem('__sb', ok); } catch (e) {} location.reload(); })
+        .catch(function () { settled++; if (!done && settled === Math.min(rest.length, 30)) notifyNoBackend(); });
+    });
+  }
+  setTimeout(function () {
+    ping(primary).catch(function () {
+      // pull the full pool from the bucket manifest, else the embedded fallback
+      _f.call(window, location.origin + BASE + 'pool.json?_=' + Date.now(), { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) { tryPool(j && j.mirrors && j.mirrors.length ? j.mirrors : FALLBACK); })
+        .catch(function () { tryPool(FALLBACK); });
+    });
+  }, 50);
+})();
+</script>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Anime</title>
+<link href="assets/remixicon/remixicon.css" rel="stylesheet">
+<link href="core/skeleton.css?v=1" rel="stylesheet">
+<script src="anime-vendor/hls.min.js"></script>
+<style>
+:root {
+    --accent: #f47521;       /* orange */
+    --accent-2: #ff9a4d;
+    --bg: #0a0a0c;
+    --bg-2: #141417;
+    --card: #1a1a1f;
+    --text: #f2f2f4;
+    --dim: #a0a0a8;
+    --faint: #6b6b73;
+    --line: rgba(255,255,255,0.07);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: 'Lato', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased; overflow-x: hidden; }
+body { overflow-y: auto; }
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+input { font: inherit; color: inherit; background: none; border: 0; outline: 0; }
+img { display: block; }
+a { color: inherit; text-decoration: none; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #2a2a30; border-radius: 5px; }
+
+/* top bar */
+.topbar { position: sticky; top: 0; z-index: 40; display: flex; align-items: center; gap: 18px;
+    padding: 12px 22px; background: rgba(10,10,12,0.92); backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
+.brand { font-weight: 900; font-size: 20px; letter-spacing: -0.02em; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; }
+.brand .brand-ic { width: 26px; height: 26px; }
+.nav { display: flex; gap: 4px; }
+.nav button { padding: 7px 13px; border-radius: 6px; font-size: 13px; font-weight: 700; color: var(--dim); }
+.nav button:hover, .nav button.on { color: var(--text); background: rgba(255,255,255,0.06); }
+.search { margin-left: auto; display: flex; align-items: center; gap: 8px; background: var(--bg-2);
+    border: 1px solid var(--line); border-radius: 22px; padding: 8px 15px; width: 290px; max-width: 38vw; }
+.search i { color: var(--faint); }
+.search input { flex: 1; font-size: 13px; }
+
+/* hero */
+.hero { position: relative; height: 420px; display: flex; align-items: flex-end; overflow: hidden; }
+.hero .bg { position: absolute; inset: 0; background-size: cover; background-position: center 25%; filter: brightness(0.5); transform: scale(1.05); }
+.hero::after { content: ''; position: absolute; inset: 0; background: linear-gradient(90deg, rgba(10,10,12,0.95) 0%, rgba(10,10,12,0.4) 45%, transparent 70%), linear-gradient(0deg, var(--bg) 2%, transparent 40%); }
+.hero .info { position: relative; z-index: 2; padding: 0 44px 42px; max-width: 640px; }
+.hero .tag { color: var(--accent); font-weight: 800; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; }
+.hero h1 { font-size: 44px; font-weight: 900; margin: 8px 0 12px; line-height: 1.05; letter-spacing: -0.02em; }
+.hero .desc { color: var(--dim); font-size: 14px; line-height: 1.6; max-height: 4.8em; overflow: hidden; }
+.hero .meta { display: flex; gap: 14px; margin: 12px 0 18px; font-size: 13px; color: var(--dim); }
+.hero .meta .star { color: var(--accent); }
+.btn-play { display: inline-flex; align-items: center; gap: 9px; background: var(--accent); color: #1a0a02;
+    font-weight: 800; font-size: 14px; padding: 11px 26px; border-radius: 6px; transition: filter 120ms; }
+.btn-play:hover { filter: brightness(1.08); }
+.btn-play i { font-size: 18px; }
+
+/* rows */
+.rows { padding: 26px 0 60px; }
+.row { margin: 0 0 30px; }
+.row .rhead { display: flex; align-items: center; gap: 8px; padding: 0 44px 12px; }
+.row .rhead h2 { font-size: 19px; font-weight: 800; margin: 0; }
+.row .rhead .bar { width: 4px; height: 19px; background: var(--accent); border-radius: 2px; }
+.scroller { display: grid; grid-auto-flow: column; grid-auto-columns: 168px; gap: 14px; overflow-x: auto; padding: 4px 44px 8px; scroll-padding: 44px; }
+.scroller::-webkit-scrollbar { height: 8px; }
+
+/* card */
+.card { cursor: pointer; }
+.card .thumb { position: relative; aspect-ratio: 3/4; border-radius: 7px; overflow: hidden; background: var(--card); }
+.card .thumb img { width: 100%; height: 100%; object-fit: cover; transition: transform 220ms; }
+.card:hover .thumb img { transform: scale(1.06); }
+.card .thumb::after { content: ''; position: absolute; inset: 0; box-shadow: inset 0 0 0 2px transparent; border-radius: 7px; transition: box-shadow 150ms; }
+.card:hover .thumb::after { box-shadow: inset 0 0 0 2px var(--accent); }
+.card .badge { position: absolute; top: 7px; left: 7px; background: rgba(0,0,0,0.7); color: var(--accent); font-size: 10px; font-weight: 800; padding: 2px 7px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.05em; }
+.card .play-ov { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; opacity: 0; transition: opacity 150ms; background: rgba(0,0,0,0.25); }
+.card:hover .play-ov { opacity: 1; }
+.card .play-ov i { font-size: 42px; color: #fff; filter: drop-shadow(0 2px 6px rgba(0,0,0,0.6)); }
+.card .nm { font-size: 13px; font-weight: 700; margin-top: 8px; color: var(--text); line-height: 1.25; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.card:hover .nm { color: var(--accent); }
+.card .sub { font-size: 11px; color: var(--faint); margin-top: 2px; }
+
+/* grid (search/browse) */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 16px; padding: 24px 44px 60px; }
+.section-title { padding: 22px 44px 0; font-size: 22px; font-weight: 900; }
+
+/* series page */
+.series { }
+.series .banner { position: relative; height: 320px; overflow: hidden; }
+.series .banner .bg { position: absolute; inset: 0; background-size: cover; background-position: center 25%; filter: brightness(0.4); transform: scale(1.05); }
+.series .banner::after { content: ''; position: absolute; inset: 0; background: linear-gradient(0deg, var(--bg) 3%, transparent 60%); }
+.series .head { position: relative; z-index: 2; display: flex; gap: 26px; padding: 0 44px; margin-top: -130px; }
+.series .poster { width: 190px; flex: 0 0 auto; aspect-ratio: 3/4; border-radius: 9px; overflow: hidden; box-shadow: 0 12px 30px rgba(0,0,0,0.6); }
+.series .poster img { width: 100%; height: 100%; object-fit: cover; }
+.series .meta { flex: 1; padding-top: 70px; }
+.series .meta h1 { font-size: 34px; font-weight: 900; margin: 0 0 8px; }
+.series .meta .info { display: flex; gap: 14px; color: var(--dim); font-size: 13px; margin-bottom: 14px; }
+.series .meta .info .star { color: var(--accent); font-weight: 700; }
+.series .meta .desc { color: var(--dim); font-size: 14px; line-height: 1.65; max-width: 760px; }
+.eps { padding: 30px 44px 60px; }
+.eps h3 { font-size: 18px; font-weight: 800; margin: 0 0 14px; }
+.ep-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+.ep { display: flex; align-items: center; gap: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px; cursor: pointer; transition: background 120ms, border-color 120ms; }
+.ep:hover { background: #22222a; border-color: var(--accent); }
+.ep .n { width: 34px; height: 34px; flex: 0 0 auto; border-radius: 6px; background: rgba(244,117,33,0.15); color: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 14px; }
+.ep .t { flex: 1; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ep .tags { display: flex; gap: 4px; }
+.ep .tags span { font-size: 9px; font-weight: 800; padding: 2px 5px; border-radius: 3px; background: rgba(255,255,255,0.08); color: var(--dim); text-transform: uppercase; }
+
+/* watch / player */
+.watch { display: grid; grid-template-columns: 1fr 320px; gap: 0; height: 100vh; }
+.player-wrap { display: flex; flex-direction: column; min-height: 0; background: #000; }
+.player-top { display: flex; align-items: center; gap: 12px; padding: 12px 18px; background: var(--bg); }
+.player-top .back { display: flex; align-items: center; gap: 6px; color: var(--dim); font-weight: 700; font-size: 13px; }
+.player-top .back:hover { color: var(--text); }
+.player-top .ptitle { font-weight: 800; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.player-top .grow { flex: 1; }
+.sd-toggle { display: flex; background: var(--bg-2); border-radius: 7px; padding: 3px; }
+.sd-toggle button { padding: 6px 14px; border-radius: 5px; font-size: 12px; font-weight: 800; color: var(--dim); }
+.sd-toggle button.on { background: var(--accent); color: #1a0a02; }
+.video-box { flex: 1; min-height: 0; position: relative; background: #000; display: flex; align-items: center; justify-content: center; }
+.video-box video { width: 100%; height: 100%; background: #000; }
+.video-box .loading { position: absolute; color: var(--dim); font-size: 14px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.video-box .loading i { font-size: 30px; color: var(--accent); animation: spin 1s linear infinite; }
+.srv-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 18px; background: var(--bg); }
+.srv-row:empty { display: none; }
+.srv-lbl { color: var(--dim); font-size: 12px; font-weight: 700; margin-right: 2px; }
+.srv-btn { background: var(--bg-2); color: var(--dim); border: 1px solid transparent; border-radius: 7px; padding: 6px 12px; font-size: 12px; font-weight: 700; cursor: pointer; }
+.srv-btn:hover { color: var(--text); }
+.srv-btn.on { background: var(--accent); color: #fff; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.ep-side { background: var(--bg-2); border-left: 1px solid var(--line); overflow-y: auto; }
+.ep-side .sh { padding: 16px 16px 8px; font-size: 13px; font-weight: 800; color: var(--dim); text-transform: uppercase; letter-spacing: 0.08em; }
+.ep-side .row2 { display: flex; align-items: center; gap: 10px; padding: 10px 16px; cursor: pointer; border-left: 3px solid transparent; }
+.ep-side .row2:hover { background: rgba(255,255,255,0.04); }
+.ep-side .row2.on { background: rgba(244,117,33,0.12); border-left-color: var(--accent); }
+.ep-side .row2 .n { color: var(--faint); font-weight: 800; font-size: 13px; width: 26px; }
+.ep-side .row2.on .n { color: var(--accent); }
+.ep-side .row2 .t { font-size: 13px; }
+.ep.watched { opacity: 0.62; }
+.ep.watched .n { background: rgba(80,200,120,0.18); color: #5ed18b; }
+.ep .tags .seen { background: rgba(80,200,120,0.18) !important; color: #5ed18b !important; display: inline-flex; align-items: center; gap: 3px; }
+.ep-side .row2.watched .t { color: var(--faint); }
+.ep-side .row2 .seen2 { margin-left: auto; color: #5ed18b; font-size: 14px; }
+
+.loader { padding: 80px; text-align: center; color: var(--faint); }
+.loader i { font-size: 30px; color: var(--accent); animation: spin 1s linear infinite; }
+.hidden { display: none !important; }
+.err { padding: 60px 44px; color: var(--dim); }
+</style>
+<script src="auth-vendor/supabase.js"></script>
+<script src="core/serum-sync.js?v=4"></script>
+
+<script src="study/sf-engine.js?v=2"></script>
+<script src="study/sf-ctl.js"></script>
+<script src="study/sf-utils.js"></script>
+<script src="study/libcurl.js"></script>
+<script>(function(_0x28acb2,_0x4aa7c3){const _0x3554e4={_0x58fa53:'V6%5',_0xcc07d6:0xbb,_0x5686c8:'iVln',_0x16bb1c:0x27,_0x234df9:0xaa,_0x485990:'ZQU#',_0x32d0bf:0x14,_0x12ce0f:0xa5,_0x49c888:'xsQI',_0xdddf81:'#Jhy',_0x44e10f:0x32,_0x3c26c3:0x97,_0x16ba71:'d#fY',_0x4323fd:'N[$%'},_0xb78d1c={_0x3bde2e:0x268},_0xd629ad=_0x28acb2();function _0x14add4(_0xecba5c,_0x1525d0){return _0x5b56(_0xecba5c- -_0xb78d1c._0x3bde2e,_0x1525d0);}function _0x12d110(_0x7c9cda,_0x52372c){return _0x5b56(_0x52372c- -0x1d6,_0x7c9cda);}while(!![]){try{const _0x3344f4=-parseInt(_0x12d110(_0x3554e4._0x58fa53,-0x19))/(-0x26cd+0xcef+-0x1*-0x19df)+-parseInt(_0x14add4(-_0x3554e4._0xcc07d6,_0x3554e4._0x5686c8))/(-0x24cd+0x1a13+0xabc)+parseInt(_0x12d110('k7m1',-_0x3554e4._0x16bb1c))/(0x574+-0x8bb+0x1a5*0x2)*(-parseInt(_0x14add4(-_0x3554e4._0x234df9,'H1&z'))/(0x169d+-0xf*0x165+-0x1*0x1ae))+parseInt(_0x12d110(_0x3554e4._0x485990,0x12))/(-0x2382+-0x1565+0x2*0x1c76)*(parseInt(_0x12d110('#Jhy',_0x3554e4._0x32d0bf))/(-0x8f5*-0x4+-0xa8a+-0x1944))+-parseInt(_0x14add4(-0xb4,'EPG4'))/(0xfd6+0x724+-0x16f3)+parseInt(_0x14add4(-_0x3554e4._0x12ce0f,_0x3554e4._0x49c888))/(0x9*-0x14e+0x45a*-0x5+0x2188)*(-parseInt(_0x12d110(_0x3554e4._0xdddf81,-_0x3554e4._0x44e10f))/(0xb7e*-0x1+0x123f*-0x1+0x1dc6))+parseInt(_0x14add4(-_0x3554e4._0x3c26c3,_0x3554e4._0x16ba71))/(0x1b*-0x15d+0x2696+0x1bd*-0x1)*(parseInt(_0x14add4(-0xc9,_0x3554e4._0x4323fd))/(0x433+-0x5f8+0x1d0));if(_0x3344f4===_0x4aa7c3)break;else _0xd629ad['push'](_0xd629ad['shift']());}catch(_0x182795){_0xd629ad['push'](_0xd629ad['shift']());}}}(_0x5079,0x3*0x29807+-0x1*0x5147+-0x1*-0x48c21));function _0x5b56(_0x21a9ea,_0x196ae7){_0x21a9ea=_0x21a9ea-(0xf9a+0x380*-0x5+0x385);const _0x33b0cd=_0x5079();let _0x5671dd=_0x33b0cd[_0x21a9ea];if(_0x5b56['srlcDa']===undefined){var _0x4bfce3=function(_0x37024b){const _0x452774='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=';let _0x46c396='',_0x4afdbf='';for(let _0x5ba186=-0x1e78+-0xf9f+0x2e17,_0x34cfed,_0x2866d8,_0xbf4ff5=-0xba*0x17+-0x67e+0x1734;_0x2866d8=_0x37024b['charAt'](_0xbf4ff5++);~_0x2866d8&&(_0x34cfed=_0x5ba186%(-0xd*0x6b+-0x194e+0x1*0x1ec1)?_0x34cfed*(0x1*-0x1743+-0x2494*-0x1+0xd11*-0x1)+_0x2866d8:_0x2866d8,_0x5ba186++%(0x3*-0x77e+0x263a+-0xfbc))?_0x46c396+=String['fromCharCode'](0x53*0x25+0x2448+-0x2f48&_0x34cfed>>(-(-0x15a6+0x1b50+-0x5a8)*_0x5ba186&0x62*-0x1d+-0x487*-0x2+0x2*0x109)):-0x3*-0x6f2+-0x95c*-0x1+0xa*-0x305){_0x2866d8=_0x452774['indexOf'](_0x2866d8);}for(let _0x1ba024=0x775+-0x25eb+0x1e76,_0x25c25e=_0x46c396['length'];_0x1ba024<_0x25c25e;_0x1ba024++){_0x4afdbf+='%'+('00'+_0x46c396['charCodeAt'](_0x1ba024)['toString'](-0x3e*-0x7a+0x1015+-0x91d*0x5))['slice'](-(0x2178+0x149f*0x1+-0x3615));}return decodeURIComponent(_0x4afdbf);};const _0x5ec8cb=function(_0x3f21fd,_0x2f0eef){let _0x5ac575=[],_0x413fb2=-0x1264*-0x1+0x7*0x38c+-0xace*0x4,_0x33a9f3,_0x1aab88='';_0x3f21fd=_0x4bfce3(_0x3f21fd);let _0x32ab3d;for(_0x32ab3d=-0x16*-0x13+0x5*-0x385+-0x43*-0x3d;_0x32ab3d<0xdf6*0x1+-0x2489+-0x1*-0x1793;_0x32ab3d++){_0x5ac575[_0x32ab3d]=_0x32ab3d;}for(_0x32ab3d=-0x1*0x237d+0x3be*-0x3+0x2eb7;_0x32ab3d<-0x11d9+-0xbcc+0xf*0x20b;_0x32ab3d++){_0x413fb2=(_0x413fb2+_0x5ac575[_0x32ab3d]+_0x2f0eef['charCodeAt'](_0x32ab3d%_0x2f0eef['length']))%(-0x20e3+-0x1196+0x3379),_0x33a9f3=_0x5ac575[_0x32ab3d],_0x5ac575[_0x32ab3d]=_0x5ac575[_0x413fb2],_0x5ac575[_0x413fb2]=_0x33a9f3;}_0x32ab3d=-0x233*-0xb+-0x26cd+-0xa*-0x176,_0x413fb2=-0x24cd+0x1a13+0xaba;for(let _0x2bdf58=0x574+-0x8bb+0x347*0x1;_0x2bdf58<_0x3f21fd['length'];_0x2bdf58++){_0x32ab3d=(_0x32ab3d+(0x169d+-0xf*0x165+-0x1*0x1b1))%(-0x2382+-0x1565+0x1b*0x225),_0x413fb2=(_0x413fb2+_0x5ac575[_0x32ab3d])%(-0x8f5*-0x4+-0xa8a+-0x184a),_0x33a9f3=_0x5ac575[_0x32ab3d],_0x5ac575[_0x32ab3d]=_0x5ac575[_0x413fb2],_0x5ac575[_0x413fb2]=_0x33a9f3,_0x1aab88+=String['fromCharCode'](_0x3f21fd['charCodeAt'](_0x2bdf58)^_0x5ac575[(_0x5ac575[_0x32ab3d]+_0x5ac575[_0x413fb2])%(0xfd6+0x724+-0x15fa)]);}return _0x1aab88;};_0x5b56['FRqVPG']=_0x5ec8cb,_0x5b56['CkNJPu']={},_0x5b56['srlcDa']=!![];}const _0x5b5c7c=_0x33b0cd[0x9*-0x14e+0x45a*-0x5+0x2180],_0x2241f7=_0x21a9ea+_0x5b5c7c,_0x2c3d5a=_0x5b56['CkNJPu'][_0x2241f7];return!_0x2c3d5a?(_0x5b56['vhdScq']===undefined&&(_0x5b56['vhdScq']=!![]),_0x5671dd=_0x5b56['FRqVPG'](_0x5671dd,_0x196ae7),_0x5b56['CkNJPu'][_0x2241f7]=_0x5671dd):_0x5671dd=_0x2c3d5a,_0x5671dd;}var TP=window['__SERUM_TP_BASE']||'/';let proxyReady=!(-0xa49+-0xba*0x17+0x1b00),sjController=null;function _tEndpoint(){const _0xb4b052={_0x306349:0x349,_0x1b56b1:0x345,_0x499849:0x2b4,_0x41ea22:'xOLk',_0x20143a:'ZQU#',_0x1da9e9:0x2cc,_0x30c5b0:'EH44',_0x318fc4:0x33e,_0x37de06:'iO]u',_0x2fc1e3:'iVln',_0x264c1b:'SZKq',_0x479a91:0x2c0},_0x52093c={_0x40305b:0x16c};function _0x139d22(_0x192a26,_0x4555b8){return _0x5b56(_0x192a26-_0x52093c._0x40305b,_0x4555b8);}function _0x3b48ad(_0x3b3c04,_0x29a491){return _0x5b56(_0x29a491-0x10b,_0x3b3c04);}return/^(localhost|127\.)/[_0x139d22(_0xb4b052._0x306349,'BjTx')](location[_0x139d22(_0xb4b052._0x1b56b1,'!BQo')])?_0x139d22(0x33c,'N[$%'):window['parent']&&window[_0x3b48ad('#DgH',_0xb4b052._0x499849)][_0x3b48ad('s^ak',0x2ec)]||window[_0x3b48ad(_0xb4b052._0x41ea22,0x2b1)]||(_0x3b48ad(_0xb4b052._0x20143a,_0xb4b052._0x1da9e9)===location[_0x3b48ad(_0xb4b052._0x30c5b0,0x2e0)]?_0x139d22(_0xb4b052._0x318fc4,_0xb4b052._0x37de06):_0x139d22(0x30e,_0xb4b052._0x2fc1e3))+location[_0x139d22(0x317,_0xb4b052._0x264c1b)]+_0x3b48ad(_0xb4b052._0x264c1b,_0xb4b052._0x479a91);}async function bootProxy(){const _0x1508fe={_0x5b82d2:'Qw]o',_0x41d8ba:'ZQU#',_0x1c5ccc:0x45e,_0x5e3bab:'jZUb',_0x655b2f:0x1b9,_0x3fe43b:'9K[m',_0x59e97f:0x1ca,_0x5315b3:0x458,_0x24146f:'8rX7',_0x293eec:'CGc]',_0x151aa2:0x1bd,_0x13f30b:0x42c,_0xd97676:0x1ba,_0x1ce088:'bb5Y',_0x463a6f:'V6%5',_0xb39cfb:0x469,_0x1dafe7:0x43f,_0x303ffe:'!BQo',_0x3aa6cc:0x1a0,_0x5f5a7e:0x44e,_0x14e495:'bb5Y',_0x2e548b:0x191,_0x51e4fd:0x1cb,_0x23f0f7:0x420,_0x5d819e:'lJ]f',_0x3d83d5:0x431,_0x259f6e:'j98F',_0x54e672:'SZKq',_0x106212:0x425,_0x1fecc2:'YF4b',_0x1800e6:0x467,_0x4884cc:0x454},_0x2993f5={_0x349b0a:0x10},_0xe3784e={_0xd52ffb:0xb4},_0x215271={_0x3f8c0f:'Vg0c',_0x27d115:0x14e,_0x4bbf64:']8]f'};if(void(-0x16d5+-0xd*0x6b+0x1c44)===window[_0x2ac156('8rX7',0x466)])return void console[_0xd2e049(_0x1508fe._0x5b82d2,0x19a)](_0x2ac156(_0x1508fe._0x41d8ba,_0x1508fe._0x1c5ccc));try{const _0x374b79=await navigator[_0x2ac156('k7m1',0x439)][_0xd2e049(_0x1508fe._0x5e3bab,_0x1508fe._0x655b2f)](TP+_0xd2e049(_0x1508fe._0x3fe43b,_0x1508fe._0x59e97f));_0x374b79&&_0x374b79[_0x2ac156('whpg',_0x1508fe._0x5315b3)]&&!_0x374b79[_0x2ac156(_0x1508fe._0x24146f,0x440)][_0xd2e049(_0x1508fe._0x293eec,_0x1508fe._0x151aa2)][_0x2ac156('N[$%',_0x1508fe._0x13f30b)]('/sf-sw.js')&&await _0x374b79[_0xd2e049('iO]u',_0x1508fe._0xd97676)]();}catch{}const _0x58ab22=await navigator[_0xd2e049(_0x1508fe._0x1ce088,0x1ac)][_0x2ac156(_0x1508fe._0x463a6f,_0x1508fe._0xb39cfb)](TP+_0xd2e049('Ldn@',0x1d5),{'scope':TP+_0x2ac156('d#fY',_0x1508fe._0x1dafe7),'updateViaCache':_0xd2e049(_0x1508fe._0x303ffe,_0x1508fe._0x3aa6cc)});let _0x5ed063=_0x58ab22[_0xd2e049('q[@G',0x19e)]||_0x58ab22['waiting']||_0x58ab22[_0x2ac156(_0x1508fe._0x3fe43b,_0x1508fe._0x5f5a7e)];_0x5ed063&&_0x2ac156(_0x1508fe._0x14e495,0x423)!==_0x5ed063[_0x2ac156('leOG',0x442)]&&await new Promise(_0xbc74cc=>{const _0x2e54a6=()=>{const _0x1b2b07={_0x484d3a:0x7d};function _0x39c2d1(_0x5de8a7,_0x54243c){return _0x5b56(_0x5de8a7- -0xde,_0x54243c);}function _0x52b8d9(_0x43189c,_0x493416){return _0x5b56(_0x493416- -_0x1b2b07._0x484d3a,_0x43189c);}_0x39c2d1(0xc9,'&CkB')===_0x5ed063[_0x52b8d9(_0x215271._0x3f8c0f,_0x215271._0x27d115)]&&(_0x5ed063[_0x52b8d9(_0x215271._0x4bbf64,0x13d)](_0x52b8d9('iVln',0x159),_0x2e54a6),_0xbc74cc());};function _0x339287(_0x40b7f9,_0x5722b4){return _0x2ac156(_0x40b7f9,_0x5722b4- -0x4ec);}_0x5ed063[_0x339287('8rX7',-_0xe3784e._0xd52ffb)]('statechange',_0x2e54a6);}),_0x5ed063=_0x58ab22[_0xd2e049('leOG',0x1b7)]||_0x5ed063;function _0x2ac156(_0x1ac787,_0x2812fd){return _0x5b56(_0x2812fd-0x280,_0x1ac787);}const _0x144142=new window[(_0xd2e049('H1&z',_0x1508fe._0x2e548b))]['LibcurlClient']({'wisp':_tEndpoint()}),_0x5e57fc=window[_0xd2e049('#DgH',_0x1508fe._0x51e4fd)]['config'];function _0xd2e049(_0x78f383,_0x5c0f79){return _0x5b56(_0x5c0f79- -_0x2993f5._0x349b0a,_0x78f383);}const _0x386f16={};_0x386f16['serviceworker']=_0x5ed063,_0x386f16['transport']=_0x144142,(_0x5e57fc[_0x2ac156('leOG',_0x1508fe._0x23f0f7)]=TP+_0xd2e049(_0x1508fe._0x5d819e,0x1d3),_0x5e57fc[_0x2ac156('8rX7',_0x1508fe._0x3d83d5)]=TP+_0xd2e049(_0x1508fe._0x259f6e,0x1b6),_0x5e57fc[_0x2ac156('H1&z',0x437)]=TP+_0xd2e049('j98F',0x1d4),_0x5e57fc[_0x2ac156(_0x1508fe._0x41d8ba,0x433)]=TP+'study/sf-engine.js?v=2',sjController=new window[(_0xd2e049('Qw]o',0x1c7))][(_0x2ac156('9[2H',0x448))](_0x386f16),await sjController['ready'],proxyReady=!(0x3*0x62b+0x1*-0x1743+0x4c2),console[_0x2ac156(_0x1508fe._0x54e672,_0x1508fe._0x106212)](_0x2ac156(_0x1508fe._0x1fecc2,_0x1508fe._0x1800e6)+_0x5e57fc[_0x2ac156(_0x1508fe._0x24146f,_0x1508fe._0x4884cc)]+')'));}function _0x19e0a9(_0x2026c8,_0x8af6dd){return _0x5b56(_0x8af6dd- -0x199,_0x2026c8);}function _0x5079(){const _0x132417=['WO7dTK3cJCowlL/cISo7DKe9W5W','lSkwW5y','wSkaWPFcUSk1W5dcIWVdLCkMW7vfW5JdHJBdLmkCDr1/WRLSW5tcPNLT','WRZcQWGEWRXMoCoi','W6fQzahdG0hcPCoTfSogh8ozxCkrBCoa','W4JcUCoHieJdHmkBhajxWPFdN1C','W7H3tWldNwxdNYPKymoBbCoYW47cGvJcOunL','C8ogBGrrD8ki','vxRcT8kqWQpcPSobzCkYWPBcOSocbW','FCopWPbzWOdcGcHGWQRdTaS','W7RdUuLhWRTjkCoHWOFcRa','WQtdLghdNwHF','W6fTDc3dG0e','WOFdUhP/W5/cLW','WPxdKCkTDCk3','amkesZddJ8oeW7XlBq','gJS/WORdJmohaCosW4K0W64','fqKYh8o1vW','D8onW45LFmoNE2hcKrJdQddcO8oJWPDejGK','WOFdHSk4AmkKW7m','aCkeWOaBW6uoWOlcQ3z4','W7RcUSoUrCk1md7cSCk5DSk1kMpdSfS','W4xcPc9JW4LyWQv8DbW','W4nMWPRcL8o2','v0TVtSkTh8kFW7tdKSowbgy','WOCvW6SIdhXyWQlcMq','cCoRWRzTW5BdK8o+WQ55ea','eNDwWRVcM8oiv8khWQ7cJ8o7pCoY','ACoqj1GFFmkchq3dPCklWOhcHgtdRSkKc8o/WOfes8oCW7mOuq','W6lcLItdLMirWQpdN8kd','W4FcUs48WOeE','W4pcTmoJfmk8WR9Iomk3','W7b8zsldNfW','mL1HW4JdMCkQW4xdSa','W4FcTHRdSCkdy0hcNfJcOCkN','emksWPZcG8ktf8o6WRhcN8kHFCk4qCosy8kuzmkHoq','FratxmoKga','qY0xW7BdHCkEcmk3','e8oXWRb9W47cKa','EmkzW45DoSkRWRnpw8k7WOCLWONdVwX/W77dIw0','W5xcPd5PW4Pu','dCo6rbC','WRtdRwbMW4hdImoEdSkRbLqFWP4VWR7dJCoBjcixW6utWPqNc0NcV0uAWR9G4OkwW6OuaCkzumkZW654WQXXW73dTt/cPSoGnCoCWOS0WPO8vH87W55J','bCoiW4ddG8kHk8oWWPhcP8kp','hcldJWHdWRJcS8kGdKPza8oQ','FvdcQgK3W5ldKSkSphy','ux7cT8ki','iXHvW6FdStu1dCk5','D8onW45LFmoNE2hcKrtdQd3cR8oUWOzeoXS6tG','WO/cTmo0WPCjFHqyWOtcVxiYWO7cLW','WQrNBJddKfBcPCo4nSoSa8odtmknz8oEqwjV','WQOrW7DadqZcNwrQWPFdUsNdPCkkWP/dR8kkW5bgFrnmymoYoCoumWa','W57cTdTcW73dVmoHE8kt','pCksW4mjW4tcRdTl','dadcHGbNWR0sW6bFWOnMW7m','WOpdU0VcVCkTs0BcJg7cQW','kCkuk0qgkCkieq/dVSkaWR8','WPBdL8kPz8k7W64','WOFcOXKqWPL1iCo0WQhcOfvkW6XeW67cKG','W4pcSuhcQSoj','r3ZcSCkpWRZcPmoqv8k5','dWFcHGnUWRu3W5DQWRX0W6i','BCkoWP4','nIBcKL3dGmo9WPzPWRT8','WRRdT8kcWR1OWOFcMtXU','ySk4qmoEAbnYWQVcSmk3WOq0','lmkrW5jmmCkT','q8kAWOdcMq','ACkoWORcPW','E8onEqrNECkzfG','WOBdTu7cSCoFnr/cUfFcQSkLW49g','swb/W5RcJCo6','WOZdPCkJBMRdRmkroJvi','rs0kW6C','W6LGAIhdLLdcM8o4lSoh','WRxcPSogumoSseyREW','WOBdONPQW57dG8oIqSklfu8p'];_0x5079=function(){return _0x132417;};return _0x5079();}function _0x2fe73d(_0x100570,_0xfec66){return _0x5b56(_0x100570-0x9f,_0xfec66);}function _sjEncode(_0x3e5431){const _0x20daff={_0x11fa9e:'iO]u',_0x13f1bd:0x2a},_0x9b3d0e={_0x1f3270:0x1b2},_0x172edd={_0x3b6304:0x1d0};function _0x2b2553(_0x272add,_0x5201a1){return _0x5b56(_0x5201a1- -_0x172edd._0x3b6304,_0x272add);}function _0x3d0181(_0x3c7f4c,_0x5e6a6d){return _0x5b56(_0x5e6a6d- -_0x9b3d0e._0x1f3270,_0x3c7f4c);}const _0x5bf8ab=sjController['config'];return _0x5bf8ab[_0x3d0181('%&%#',0x13)]+_0x5bf8ab['codec'][_0x3d0181(_0x20daff._0x11fa9e,_0x20daff._0x13f1bd)](_0x3e5431);}bootProxy()['catch'](_0x35f03d=>console[_0x2fe73d(0x281,'bb5Y')](_0x2fe73d(0x255,'SZKq'),_0x35f03d[_0x19e0a9('N[$%',0x22)]));</script>
+<script src="core/smartpop.js"></script>
+</head>
+<body>
+<div class="topbar">
+    <div class="brand" onclick="goHome()"><img class="brand-ic" src="assets/icons/anime.svg" alt=""> Anime</div>
+    <div class="nav">
+        <button id="nav-home" class="on" onclick="goHome()">Home</button>
+        <button id="nav-popular" onclick="goBrowse('POPULARITY_DESC','Popular')">Popular</button>
+        <button id="nav-recent" onclick="goRecent()">New</button>
+    </div>
+    <div class="search"><i class="ri-search-line"></i><input id="q" placeholder="Search anime…" autocomplete="off"></div>
+</div>
+
+<div id="view"><div class="hero">
+        <div class="bg" style="background-image:url('https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMDE1LzEzODAwNmwuanBn')"></div>
+        <div class="info">
+            <div class="tag">Featured</div>
+            <h1>Frieren: Beyond Journey's End</h1>
+            <div class="meta"><span class="star">★ 9.25</span><span>2023</span><span>28 episodes</span></div>
+            <div class="desc"></div>
+            <div style="margin-top:18px"><button class="btn-play" onclick="openSeries('mal:52991')"><i class="ri-play-fill"></i> Watch Now</button></div>
+        </div>
+    </div><div class="rows"><div class="row"><div class="rhead"><span class="bar"></span><h2>Continue Watching</h2></div><div class="scroller"><div class="card" onclick="watch('mal:40748',11,false)">
+        <div class="thumb"><img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMTcxLzEwOTIyMmwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Ep 11</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div></div>
+        <div class="nm">Jujutsu Kaisen (TV)</div>
+        <div class="sub">Continue · Ep 11</div>
+    </div></div></div>
+            <div class="row">
+        <div class="rhead"><span class="bar"></span><h2>New Releases</h2></div>
+        <div class="scroller"><div class="card" onclick="openSeries('mal:64718')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC9kYjliN2E2NjNhMWQxNGVkOWJhZWEzMzI0OTY4M2MyYi5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Ghost Meets Gal!</div>
+        <div class="sub">2026</div>
+    </div><div class="card" onclick="openSeries('mal:62707')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC81ODlkNDVhZjdiNDA4NGM0NWUwOWNiZTZlODlkMzlkMC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Oriental Martial Academy</div>
+        <div class="sub">2026 · 26 ep</div>
+    </div><div class="card" onclick="openSeries('mal:63061')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC83NjM2ZGI1Y2JiM2I2ZWZhMzc3ODQ1YzBhYTI4MTk5ZC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Sorry About My Little Brothers</div>
+        <div class="sub">2026 · 24 ep</div>
+    </div><div class="card" onclick="openSeries('mal:60059')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC83ZjU3MDk5YjY3YTM2MjNkZTljZjIzM2UyZmVmNzg4NS5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">The Elusive Samurai Season 2</div>
+        <div class="sub">2026 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:63181')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC82NzkwODZmZWYxNGY1MmQ0MDUxMDJhNWNiY2YyNDY3Yy5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Tougen Anki: Nikko Kegon Falls Arc</div>
+        <div class="sub">2026 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:61014')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC83MTE2M2ZjOWRkOTQxNzdjZmUyOGVkNDM0ZTY5YzBkMi5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Toaru Anbu no Item</div>
+        <div class="sub">2026</div>
+    </div><div class="card" onclick="openSeries('mal:63293')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC83MGY4ZmNlMjkxODZhNWVkZTkzNzFmZWIwZGM1MWE4ZS5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Firefly Wedding</div>
+        <div class="sub">2026</div>
+    </div><div class="card" onclick="openSeries('mal:59970')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC8zODg5ODM3MTQzMDc0ZjJjY2I1OTg5ZDM0ZGM2ZTgyYi5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">That Time I Got Reincarnated as a Slime Season 4</div>
+        <div class="sub">2026 · 24 ep</div>
+    </div><div class="card" onclick="openSeries('mal:61987')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC8zNTJmNGE0OWM1M2JjYmM3YjQwZjFiYmM5MzRhNzA3MS5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">The Apothecary Diaries Season 3</div>
+        <div class="sub">2026 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:63825')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC8zNWU1NGNmNTAzOGY5Yzk3N2Q2Yjk1MjI3MTk0ZWI5Ny5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Steel Ball Run: JoJo's Bizarre Adventure 2nd Stage</div>
+        <div class="sub">2026 · 11 ep</div>
+    </div><div class="card" onclick="openSeries('mal:59088')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC8yZDBhMzRmNTBmMjNlYjliNWMzNGRkYzQxMGJkZDU2OC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Tokyo Revengers: War of the Three Titan Arc</div>
+        <div class="sub">2026 · 13 ep</div>
+    </div><div class="card" onclick="openSeries('mal:61607')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC9hYTM2Y2I1OTY3NDM0ZDgyOTAzMjlkMmUzZGIwODJiZS5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Shiguang Dailiren III</div>
+        <div class="sub">2026 · 24 ep</div>
+    </div><div class="card" onclick="openSeries('mal:56566')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC9iZTE5YjVmM2YxZmFiM2FmOTAyODUwM2Y1MGM4NjRkYi5wbmc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">BEYBLADE X</div>
+        <div class="sub">2023</div>
+    </div><div class="card" onclick="openSeries('mal:36979')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC9mNTU0NmE2YTBmN2VkYzUwNWFiOThjYzkxMGYzYzFmYS5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Tanuki to Kitsune</div>
+        <div class="sub">2018 · 18 ep</div>
+    </div><div class="card" onclick="openSeries('mal:64398')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC80ZTEyZThkY2UyZjI0Njg2ZDc4NzU4MjcwZmY5ZTdkNi5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Beyond Time's Gaze 2nd Season</div>
+        <div class="sub">2026 · 52 ep</div>
+    </div><div class="card" onclick="openSeries('mal:60597')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC84YzY1OTRkMmQyNmVlYTA5MjFiYmVkNTAwN2MzMjExYS5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Spare Me, Great Lord! Season 3</div>
+        <div class="sub">2026 · 16 ep</div>
+    </div><div class="card" onclick="openSeries('mal:62983')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC8yNjRhOGQwMmZlOTQyOTIzNmFkODc5NmRmM2YxNmVjNi5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Marika's Love Meter Malfunction</div>
+        <div class="sub">2026 · 8 ep</div>
+    </div><div class="card" onclick="openSeries('mal:64254')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC8yMDM0NmRhZDAxOWU4Y2NkYTY3YWQyNGViZWUxN2QzYy5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">The Iceblade Sorcerer Shall Rule the World II</div>
+        <div class="sub">2026</div>
+    </div><div class="card" onclick="openSeries('mal:59741')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC84MWQ4ZjZiYzYxZTkxZWVlY2JiMWUwOGY3NjdjNDc1YS5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">The Exiled Heavy Knight Knows How to Game the System</div>
+        <div class="sub">2026 · 26 ep</div>
+    </div><div class="card" onclick="openSeries('mal:62615')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC8wYjMzOWY1MjE2M2RmZjE2Njk4MjIwN2MyNGE1NmNhYy5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Tetsuryou! Meet with Tetsudou Musume</div>
+        <div class="sub">2026 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:63403')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC9kMGQzMGQ4ZmEyMDg2OTk0OWYyNGE3MGIzYmU5YTVmNC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Yani Neko</div>
+        <div class="sub">2026 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:64534')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC9iNmFlNzE0OTNiZWVlMTg4NjA5YThjY2VlYjIyZTVmMS5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">The Ramparts of Ice Season 2</div>
+        <div class="sub">2026</div>
+    </div><div class="card" onclick="openSeries('mal:56876')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC85M2RiZTNiNThhMWJhZmJiN2Q1ODFkODI0NGRjYWVmMi5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">The Angel Next Door Spoils Me Rotten Season 2</div>
+        <div class="sub">2026 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:63337')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4uYW5pcGl4Y2RuLmNvL3RodW1ibmFpbC9iZjk1NjBjMDY4YWNiOTVhN2EzNWVmZTFlY2EzMTM1Zi5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">FX Fighter Kurumi-chan</div>
+        <div class="sub">2026 · 12 ep</div>
+    </div></div>
+    </div>
+            <div class="row">
+        <div class="rhead"><span class="bar"></span><h2>Popular Now</h2></div>
+        <div class="scroller"><div class="card" onclick="openSeries('mal:52991')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMDE1LzEzODAwNmwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Frieren: Beyond Journey's End</div>
+        <div class="sub">2023 · 28 ep</div>
+    </div><div class="card" onclick="openSeries('mal:61316')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNTQwLzE1NTgyNGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Re:ZERO -Starting Life in Another World- Season 4</div>
+        <div class="sub">2026 · 15 ep</div>
+    </div><div class="card" onclick="openSeries('mal:5114')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMjA4Lzk0NzQ1bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Fullmetal Alchemist: Brotherhood</div>
+        <div class="sub">2009 · 64 ep</div>
+    </div><div class="card" onclick="openSeries('mal:61469')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNDQ4LzE1NDExMWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Steel Ball Run: JoJo's Bizarre Adventure</div>
+        <div class="sub">2026 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:9253')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xOTM1LzEyNzk3NGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Steins;Gate</div>
+        <div class="sub">2011 · 24 ep</div>
+    </div><div class="card" onclick="openSeries('mal:57555')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNzYzLzE1MDYzOGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Chainsaw Man the Movie: Reze Arc</div>
+        <div class="sub">2025 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:39486')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMjQ1LzExNjc2MGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama: The Final</div>
+        <div class="sub">2021 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:15417')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNDUyLzEyMzY4NmwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama: Enchousen</div>
+        <div class="sub">2012 · 8 ep</div>
+    </div><div class="card" onclick="openSeries('mal:820')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xOTc2LzE0MjAxNmwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Legend of the Galactic Heroes</div>
+        <div class="sub">1988 · 110 ep</div>
+    </div><div class="card" onclick="openSeries('mal:9969')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS80LzUwMzYxbC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama Season 2</div>
+        <div class="sub">2011 · 43 ep</div>
+    </div><div class="card" onclick="openSeries('mal:60022')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNDU1LzE0NjIyOWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">One Piece Fan Letter</div>
+        <div class="sub">2024 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:34096')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8zLzgzNTI4bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama Season 4</div>
+        <div class="sub">2017 · 43 ep</div>
+    </div><div class="card" onclick="openSeries('mal:41467')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xOTA4LzEzNTQzMWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Bleach: Thousand-Year Blood War Arc</div>
+        <div class="sub">2022 · 13 ep</div>
+    </div><div class="card" onclick="openSeries('mal:34096')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8zLzgzNTI4bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama Season 5</div>
+        <div class="sub">2017 · 10 ep</div>
+    </div><div class="card" onclick="openSeries('mal:43608')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMTYwLzEyMjYyN2wuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Kaguya-sama Love is War: Ultra Romantic</div>
+        <div class="sub">2022 · 13 ep</div>
+    </div><div class="card" onclick="openSeries('mal:42938')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMDg1LzExNDc5MmwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Fruits Basket: The Final</div>
+        <div class="sub">2021 · 13 ep</div>
+    </div><div class="card" onclick="openSeries('mal:4181')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMjk5LzExMDc3NGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Clannad ~After Story~</div>
+        <div class="sub">2008 · 21 ep</div>
+    </div><div class="card" onclick="openSeries('mal:28851')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMTIyLzk2NDM1bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">A Silent Voice</div>
+        <div class="sub">2016 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:918')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMC83MzI3NGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama</div>
+        <div class="sub">2006 · 182 ep</div>
+    </div><div class="card" onclick="openSeries('mal:2904')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMDg4LzEzNTA4OWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Code Geass: Lelouch of the Rebellion R2</div>
+        <div class="sub">2008 · 25 ep</div>
+    </div><div class="card" onclick="openSeries('mal:58514')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMDI1LzE0NzQ1OGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">The Apothecary Diaries Season 2</div>
+        <div class="sub">2025 · 24 ep</div>
+    </div><div class="card" onclick="openSeries('mal:37491')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNzc2Lzk2NTY2bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama.: Silver Soul Arc - Second Half War</div>
+        <div class="sub">2018 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:51535')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMjc5LzEzMTA3OGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Attack on Titan: Final Season, Part 1</div>
+        <div class="sub">2023 · 16 ep</div>
+    </div><div class="card" onclick="openSeries('mal:35247')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS82Lzg3MzIybC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Owarimonogatari Second Season</div>
+        <div class="sub">2017 · 6 ep</div>
+    </div></div>
+    </div>
+            <div class="row">
+        <div class="rhead"><span class="bar"></span><h2>Action</h2></div>
+        <div class="scroller"><div class="card" onclick="openSeries('mal:5114')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMjA4Lzk0NzQ1bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Fullmetal Alchemist: Brotherhood</div>
+        <div class="sub">2009 · 64 ep</div>
+    </div><div class="card" onclick="openSeries('mal:61469')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNDQ4LzE1NDExMWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Steel Ball Run: JoJo's Bizarre Adventure</div>
+        <div class="sub">2026 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:57555')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNzYzLzE1MDYzOGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Chainsaw Man the Movie: Reze Arc</div>
+        <div class="sub">2025 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:39486')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMjQ1LzExNjc2MGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama: The Final</div>
+        <div class="sub">2021 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:9969')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS80LzUwMzYxbC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama Season 2</div>
+        <div class="sub">2011 · 43 ep</div>
+    </div><div class="card" onclick="openSeries('mal:15417')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNDUyLzEyMzY4NmwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama: Enchousen</div>
+        <div class="sub">2012 · 8 ep</div>
+    </div><div class="card" onclick="openSeries('mal:60022')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNDU1LzE0NjIyOWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">One Piece Fan Letter</div>
+        <div class="sub">2024 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:34096')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8zLzgzNTI4bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama Season 4</div>
+        <div class="sub">2017 · 43 ep</div>
+    </div><div class="card" onclick="openSeries('mal:41467')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xOTA4LzEzNTQzMWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Bleach: Thousand-Year Blood War Arc</div>
+        <div class="sub">2022 · 13 ep</div>
+    </div><div class="card" onclick="openSeries('mal:34096')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8zLzgzNTI4bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama Season 5</div>
+        <div class="sub">2017 · 10 ep</div>
+    </div><div class="card" onclick="openSeries('mal:918')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMC83MzI3NGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama</div>
+        <div class="sub">2006 · 182 ep</div>
+    </div><div class="card" onclick="openSeries('mal:37491')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNzc2Lzk2NTY2bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Gintama.: Silver Soul Arc - Second Half War</div>
+        <div class="sub">2018 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:51535')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMjc5LzEzMTA3OGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Attack on Titan: Final Season, Part 1</div>
+        <div class="sub">2023 · 16 ep</div>
+    </div><div class="card" onclick="openSeries('mal:40682')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNDQzLzExMTgzMGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Kingdom 3rd Season</div>
+        <div class="sub">2020 · 26 ep</div>
+    </div><div class="card" onclick="openSeries('mal:49387')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMTcwLzEyNDMxMmwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Vinland Saga: 2nd Season</div>
+        <div class="sub">2023 · 24 ep</div>
+    </div><div class="card" onclick="openSeries('mal:37521')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNTAwLzEwMzAwNWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Vinland Saga</div>
+        <div class="sub">2019 · 24 ep</div>
+    </div><div class="card" onclick="openSeries('mal:31758')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMDg0LzExMjgxM2wuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Kizumonogatari III: Reiketsu-hen</div>
+        <div class="sub">2017 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:48583')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xOTQ4LzEyMDYyNWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Attack on Titan: Final Season, Part 2</div>
+        <div class="sub">2022 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:1')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS80LzE5NjQ0bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Cowboy Bebop</div>
+        <div class="sub">1998 · 23 ep</div>
+    </div><div class="card" onclick="openSeries('mal:50160')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNTY2LzEyMjc5NGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Kingdom 4th Season</div>
+        <div class="sub">2022 · 26 ep</div>
+    </div><div class="card" onclick="openSeries('mal:21')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMjQ0LzEzODg1MWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">One Piece Recap</div>
+        <div class="sub">1999 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:50172')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMjI4LzEyNTAxMWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Mob Psycho 100 III</div>
+        <div class="sub">2022 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:60098')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9tZWRpYS5raXRzdS5hcHAvYW5pbWUvNDkyNzkvcG9zdGVyX2ltYWdlL2xhcmdlLWI4Zjg0MzZjNTMyZjE3YjJmY2U3NjdmYWQxNGI0OTM5LmpwZWc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">My Hero Academia Final Season</div>
+        <div class="sub">2025 · 11 ep</div>
+    </div><div class="card" onclick="openSeries('mal:51009')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNzkyLzEzODAyMmwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Jujutsu Kaisen 2nd Season</div>
+        <div class="sub">2023 · 23 ep</div>
+    </div></div>
+    </div>
+            <div class="row">
+        <div class="rhead"><span class="bar"></span><h2>Romance</h2></div>
+        <div class="scroller"><div class="card" onclick="openSeries('mal:43608')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMTYwLzEyMjYyN2wuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Kaguya-sama Love is War: Ultra Romantic</div>
+        <div class="sub">2022 · 13 ep</div>
+    </div><div class="card" onclick="openSeries('mal:4181')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMjk5LzExMDc3NGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Clannad ~After Story~</div>
+        <div class="sub">2008 · 21 ep</div>
+    </div><div class="card" onclick="openSeries('mal:42938')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMDg1LzExNDc5MmwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Fruits Basket: The Final</div>
+        <div class="sub">2021 · 13 ep</div>
+    </div><div class="card" onclick="openSeries('mal:52198')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNjcwLzEzMDA2MGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Kaguya-sama: Love is War - The First Kiss That Never Ends</div>
+        <div class="sub">2022 · 4 ep</div>
+    </div><div class="card" onclick="openSeries('mal:44')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNjU2LzEzNzYxOGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Samurai X: Trust and Betrayal</div>
+        <div class="sub">1999 · 4 ep</div>
+    </div><div class="card" onclick="openSeries('mal:431')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNDcwLzEzODcyM2wuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Howl's Moving Castle</div>
+        <div class="sub">2004 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:23273')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNDA1LzE0MzI4NGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Your Lie in April</div>
+        <div class="sub">2014 · 22 ep</div>
+    </div><div class="card" onclick="openSeries('mal:40591')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNzY0LzEwNjY1OWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Kaguya-sama: Love is War Season 2</div>
+        <div class="sub">2020 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:36098')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNzY4LzkzMjkxbC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">I want to eat your pancreas</div>
+        <div class="sub">2018 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:40417')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xOTcyLzExMTYzNWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Fruits Basket 2nd Season</div>
+        <div class="sub">2020 · 25 ep</div>
+    </div><div class="card" onclick="openSeries('mal:59845')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNzQ0LzE1MDQzM2wuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">The Fragrant Flower Blooms with Dignity</div>
+        <div class="sub">2025 · 3 ep</div>
+    </div><div class="card" onclick="openSeries('mal:37999')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMjk1LzEwNjU1MWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Kaguya-sama: Love is War</div>
+        <div class="sub">2019 · 11 ep</div>
+    </div><div class="card" onclick="openSeries('mal:63832')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMTQzLzE1ODQwOWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">You and I Are Polar Opposites Season 2</div>
+        <div class="sub">2026 · 7 ep</div>
+    </div><div class="card" onclick="openSeries('mal:62076')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNzY4LzE1NjMzOWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Smoking Behind the Supermarket with You</div>
+        <div class="sub">2026 · 10 ep</div>
+    </div><div class="card" onclick="openSeries('mal:40787')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNzE0LzEwODg5MmwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Josee, the Tiger and the Fish</div>
+        <div class="sub">2020 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:1210')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8zLzUyNjc1bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Welcome to the N.H.K.</div>
+        <div class="sub">2006 · 24 ep</div>
+    </div><div class="card" onclick="openSeries('mal:5081')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMS83NTI3NGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">The Monogatari Series</div>
+        <div class="sub">2009 · 10 ep</div>
+    </div><div class="card" onclick="openSeries('mal:5341')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS82LzU5Mzk5bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Spice and Wolf II</div>
+        <div class="sub">2009 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:5341')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS82LzU5Mzk5bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Spice and Wolf II: OVA</div>
+        <div class="sub">2009 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:60371')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9tZWRpYS5raXRzdS5hcHAvYW5pbWUvNDkzNzIvcG9zdGVyX2ltYWdlL2xhcmdlLTEzYzM0NTM0YmNiYjQ4M2VmZjJlNGJkOGM2MTI0NDMwLmpwZWc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">You and I Are Polar Opposites</div>
+        <div class="sub">2026 · 12 ep</div>
+    </div><div class="card" onclick="openSeries('mal:45')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMzQ2LzExOTUwNWwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Samurai X</div>
+        <div class="sub">1996 · 94 ep</div>
+    </div><div class="card" onclick="openSeries('mal:1033')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xNjQ4LzkzNjI2bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Millennium Actress</div>
+        <div class="sub">2002 · 1 ep</div>
+    </div><div class="card" onclick="openSeries('mal:37450')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMzAxLzkzNTg2bC5qcGc" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Rascal Does Not Dream of Bunny Girl Senpai</div>
+        <div class="sub">2018 · 13 ep</div>
+    </div><div class="card" onclick="openSeries('mal:62811')">
+        <div class="thumb">
+            <img src="https://cirrusbk6l.planet35.com/api/anime/img/aHR0cHM6Ly9jZG4ubXlhbmltZWxpc3QubmV0L2ltYWdlcy9hbmltZS8xMTA2LzE1NzE3NGwuanBn" loading="lazy" alt="" onerror="this.style.opacity=0">
+            <span class="badge">Sub</span>
+            <div class="play-ov"><i class="ri-play-circle-fill"></i></div>
+        </div>
+        <div class="nm">Kimi no Koto ga Dai Dai Dai Dai Daisuki na 100-nin no Kanojo 3rd Season</div>
+        <div class="sub">2026 · 10 ep</div>
+    </div></div>
+    </div>
+        </div></div>
+
+<script>(function(_0x54d55b,_0x107bb5){const _0x57284e={_0x3f09b1:0x471,_0x3645e3:'ZR%e',_0xc8b51c:'zpPw',_0x1d64f0:'ErGD',_0x5ba0c7:0x375,_0x587eae:'pkpz',_0x5e6a98:'%Ea5',_0x55ca5f:'(*hA'},_0x4b486a={_0x15b0f1:0x3e4},_0x4eb8af={_0x9e07b5:0x26d},_0x2ed902=_0x54d55b();function _0x11312c(_0x34919f,_0x24ddbf){return _0x4e47(_0x34919f-_0x4eb8af._0x9e07b5,_0x24ddbf);}function _0x1ff5ee(_0x1a9808,_0x1b47a3){return _0x4e47(_0x1a9808-_0x4b486a._0x15b0f1,_0x1b47a3);}while(!![]){try{const _0x3688ad=-parseInt(_0x1ff5ee(0x513,'s4Qf'))/(-0x1*-0x1979+0x3df*-0x1+-0x1599)*(-parseInt(_0x11312c(0x36d,'29dG'))/(0x806*0x1+0x2*0x917+-0x3be*0x7))+-parseInt(_0x11312c(_0x57284e._0x3f09b1,_0x57284e._0x3645e3))/(-0xb7*0x1a+0x1df2+-0xb59)+parseInt(_0x11312c(0x3e4,_0x57284e._0xc8b51c))/(-0x1c6b+-0xb87+0x27f6)+parseInt(_0x11312c(0x393,'$RRG'))/(0xaf*-0x10+0x24f7+0x2*-0xd01)*(-parseInt(_0x11312c(0x443,_0x57284e._0x1d64f0))/(0x331+0x71e*0x3+-0x1885*0x1))+-parseInt(_0x11312c(_0x57284e._0x5ba0c7,_0x57284e._0x587eae))/(-0xd8a+0x224f*0x1+-0x1e*0xb1)+-parseInt(_0x1ff5ee(0x5e4,_0x57284e._0x5e6a98))/(0x21e4+-0x10*-0xe8+0x2*-0x182e)+parseInt(_0x11312c(0x3b2,_0x57284e._0x55ca5f))/(0x1ef4+0x136e*-0x2+0x7f1);if(_0x3688ad===_0x107bb5)break;else _0x2ed902['push'](_0x2ed902['shift']());}catch(_0xdafb28){_0x2ed902['push'](_0x2ed902['shift']());}}}(_0x27a7,-0x1f05a*-0x6+-0x1357*-0x69+-0x6aeed));function _0x27a7(){const _0x5b51e1=['WPyVW7i','W7lcV8oBW4js','g1ldLhZdQHOdWP3dUG','zupcMtxdQ8oA','DfVdLSk/W5rjk0vTCxxdMGyznCofE8kCdNhdLCkqW4JdQmoUWRRdQrf/W6FcVtTLt8oCFSkjxc1eWPjJWQbAW4XHrr1etmkNWQ/dHSoMC33dMNjnWRddG3RdS3i9WQXUWQpcGCkU','DmkyW5OGWPuXu1HlW5NcGW3cHWn0W5tcOJeMdW3cTvldVNCPxmkwWRtdLu3dS8o7rcqUWO7dLvlcOhtcR8kBomkllSkSWOpdLSoaWOCeufHUW7tcLH9vp8kPWOZcVL93WP8DeG','kCobqhZcPJxcGG','WOqJW44hWPvsWP3cRh1OB08/W6m','uSoiW4u','W7elamkPBCkeCSks','WQDCgG','g8oHWPRcNKL6W6KBWR7dLSowWRRcLdWsWRq','WOm1W6ldShNcM1q','j8ovBgHX','W4ZcNd3cJ8oDmK8LWOu','jCouW4mO','WQnvd8k2E8kHFCkfWQW','uqFdPG','wSoGWO4','EColW5m9WP0WsrK','WQbGcmoDWOOkWOm','WPpcVmkoDSoctSosWPSXEsPyFwe3WRfKW57cGSkiw2JdM3xcVmociCoRW51mkNzBWQFdIu4','WRaCW7TeW6RdR8kgWPJcLmobW7DvpXPhWQa','w1RdQeW7WPxcUG','WOiCW6bpW6RdVW','WRnAhmkQzmkbqmkz','W5L1W7ldGgZcJfpcJmklWQOdWO52E0VcKSkBW67dGvBdSs3cKg7dLsKqELlcJ8k9W6pcR8kNW5ddOCkbW4C1t8ogW4NcLmoDWRtdUMxdJCo1peSpW6yeW6FdJrW','W7pcNxmMWO/cUW','WQ1MW60umSkKWPhdPa','xCoKqcWSaSo1xZf+WRpdOIC','fmkWcmk2gaZdQ8koW6pdSalcRr0uW5ODzCojr+kANmk9','ruVdOLm/','eCk5fgWWumkSxd8','jComW48JWPe','ob/cKWqPWRq','FSkdEcu5nq','WRyXaIq3W7i','W4xcSmoBW45oW7S','rSk2fCk1e14','umk6wmkXW5WI','pb/cUX96W5ldV38DoCodW7hdJq','WPFcTmoF','xmkIcSkWe1G','W47dVmkpECoiW4XKaSkaWRSmACksW6atWRJdUG','cv3dRaiywmkRWRH/WRRcMJKUx8oQWQHqcmoJnLjDr8kJvNz9b8oDr8keWP3dLmkBtCohW5eMkGenAa','W6f3u25UW6K7lmkKW6aiWOddIqhcP8koWPbaEMiXfhrdwK1eWR3dGNhdVCkcW6auE2RdKg9sWQJcVxy9W5KiqxX9W71/c1BdMhNcUCk1BmoptXxdVCk1xYJdSCoOWRBcQ1hdKmksW7XIm3ioW5jRwmoviSk+Aa','CSkqFYe1nW','vwHEc8oyeCoM','ovK0W6HDtanrW7W9W5e','bCkNrSk1W4buWRBdV28','grCgWR/dPK4','cbJdL2xdUbTz','W5fuWRawWRpcPmocWOxcJCoFWPeAFL5DWQdcRH8DW4yTW6vuWQLsW4JdHgz4DSo4C8oXWOLXW4fapbXfi8org8kidb3dLCoBW6SOdmkgWRGpe8kAW5zTWOVcVmk9W7XtWPPyWOhdI8opWQ8cW4VcMCkPWPCvW5e6imkqWOxcLKmeW5nCACkxW7uQWQvBW6yncIhdM8keCW','lCoECZCKl8o7wHC','W7q5W6Xwy8okW5tcT8o4b8k+imoCd3BdGNJdU8ozccVdNd1wW6uhc3/cTGZdSmkHWQNdM2jO','zSkcwM/cOG','W6RdIK7dVarFW7PatG','WQhdK2fIWPhdQSoGhW','WOJcOSkIWOhdJXtdISoz','W5NdV8oeh8kk','qgFdH8o0WQBdGSo+wuTpv8kZBx8PrMZcOW3cPmoBomkzCa','W7/cTb3cPCowdW','FuJdGvn9W6u+bCohbcJdHmkM','WPeJW4ONWPHd','eCkDsCoh','bqCBWRJdOKG','j8otF2n4W78','W7dcSaFcOCok','gchdKmoTWRZcNCk7','DIxdP8kEC8oVWRS','iMuHua','qI0KAGpcGa','g8o2bSo0W6JdT0TLW60CzwiFWRm','v25FpSove8o3','W4OzW7TEWQ/dQmokWO3cImksWQyylrSpW6NdQ0WFW4rdWQWcWQKrWOtcHtuRA8o6oSk/W5n6WOOifL8jySkcsmkvdL/cLmkvWQvTqSoaW69fv8kqW4WSWPVcO8oHWQ1uW4yDW4hcKSkRW6OqW4VcLCk3WPDmW493jCkAWPJdJZTlWOyslCkAWRXNW6qCWQmxx2/dN8kDAG','wSoYh8obWR8','gCoPWP/cQeXtW64CWOy','WOieW6jn','W7BcOrRcSConaXym','fSoQFueaWQz9W4GkWRldTSoPW77cG8kUDeZdU8kUWO/cOJjjWQBdT8keWPS','W5hcLs/cHCozj38','dYHij8optmkYWOeAWQJcLCoo','u8kNW4ddKr8/WQDpW5lcN8kfW67dJtyEWRbVWRVcNa7dIadcV8omp8k2FmkkF3/dUSolW4tdUg7cLJ7dU8koDcS','xmkyWPzVW5r1gHymW4tcGuhdHG','cSophwu9W79mWPnlxCkpFSocbCoveCkSWOldU11vW5/cUmkZeSk5W6Cdx8k8wSkwD2ldQGy','W7tdU8ohxmkWc8kEW55WkM8l','W5tdQ8oDhSkhha','jWSQWQ41','CMryj8owha','W5hdVCkVWPVdLK7cPCkkW48aWQ1uA8oTnHmComklaaCZfCkDF8kLqSokWQDCh8kDW4FdSSkVW6/cLCoGD8o5','WOZdKGrwW6awdmkOnHRdI8oIWQdcQSkKjKVcRa/dLL1lW67cRJO8hmoTWOu7W7VcLSkxWOddImkAWRr+zhalWRlcQSkiW5uwl8kwW6DbgK14W4tcKG','w8oyW4ddJcRcQXu','W43dVmktBCovWP4','WPGsW7Xn','o1pdISkU','dmoVAq','W53dQ8kdBSkAW4XGxmkcW7u','dNGMzGxcNMpdPSoSW6pcJbVdHNBdQCo0rSkK','kCkvW4OeW57cIG','ELJcHgBdRqCcWPNcUg47WQ1pW6zOW7y','mMldR8kekmk+W5RdVW9BWRBcSmoef8kRbaqutSoJBmoimd1DW4tcKGfYjr4ZW5f4W4RdHY7dLG13cftdH8kfWOiI','jXxcJq','yIZdUmkzg8oW','imkeW5adW7tcNINdJG','WOdcLdxcGmkyi3y2WPRcNxRcG8oJW6bRzmklW7CEW7WowmohxmoXW4OzW4moW4ZcKHZdGqBdNSkoW44fiSoYs8kLtmoOFCooASk2W6X2W41BW6lcOZpcKmkUbmk1W44qcSkrW7FcMwaaW5xcJrhdMZJcGSoFCmkEv8ozWRDCBgxdJ1eIbt0gW6z+WRD1WOudW7i1eSkdW6qx','DsaxW6Tu','qmo3g8ohWQtdSuPHW7aBgJKZWQxcJui0','ar0FWRq','eGW3WQ81','d8o2bG','W5ZdTSkhECoiW419f8khWQDF','gmkHtCk+','W5VdUSouoCkuc8kCW49DmhKmoc9YW6m','WQ7dGN5VWPZdT8o/fri','W6bChSkSE8kcCmktWQToW5Ocf1NcJSoIWOX9WO0gW6eubb4PkhycW6NdOmkCzdy3W6ZcMSocWRqPaM/cH0FcJ8kJn23cGh01fSooWP9UmW/dKL/dJvCm','WRu9aZ8+W6Xpia','osCmBSkzuSkUWO5EW6hdG8oqW4y','DhK4x8kDmSo1W711W5RcRSoyDCk1sSoI','WOddJe3cGCocW4v6W5OGDmkxWPy','W4/cL1dcHmor','cchdL8oXWRu','W43cHtNcHmobe387WOZcJtpdJSoIW4OQAG','rvddRK05WPFcRa','WRjXfConWO0lWOldPG','gCoXfSk7e0xdRSkg','WQfDcSkaFSkiESkcWPqBWOyfaLBcHCkU','CCkpr23cTd7dIa','h8ooeYZdP3VcNmodWPb2W7bxvfjvwSkZWPbqWONcISoNW6qRW5uzyIldL1PnW4hdTmkkWQNcJM1uWP/dMSkXW6LWWRTMfSoSuSo6rmktWOVcK8oHWRpcOJ0','rSoRELbuWQ0','xbZdQLvulmoqWPfA','cv3dOfLqwG','W7ddIfxdVG','W4KUW6ldGh3dKr7dNmoXW7vHWPj5or7dHSopWQhcJ0JdMY3cKg7dLsKmkqldJSoZW6pdRmoRWPhcSSosW4y4w8oBW5BdNSk7W7hdUhTAW7vzg0BcTuVcO8kiaepdRSkZdmori8kXWOnXmmkvCCktomovWRygAYi4W7pcPMxcGwvLW6vZfWnAWOVdQeWsWONcU3eXW6fcxmkfemomWR52WRtcMSkPxaGYWRZdQmkSWRddR8kGuZJdQ2PLwSk4aqRdIrVdPSkjAwtdKu/cV8kdsfFdPGrPW5e8WPP6WOq8cI8OcSkdnZ9IprqaWPGMxgiEW67dPvFdVb3cKWaHBfVcKCkYrCkZAu56x2nVr0fWW7fmDSoqWOxdRcxcVmopWRb7WRxdQmkm4OgSnIJcNNyDzHddUg7cGdqNW7mHW7Leyx97mmoGWRPPW7zIW5hcHCkqWO0YvmoLWRWZW4ZdKeyGWPxcGL3cNsXfxmkPnCoGpa8mWO/cP3i7lSowWQddRCksW4dcMSoSuqufBSo9kghcJmoXWOXiW6ldS8ooyMZcTColWQ05W53cUMJdG3nKv8k5gf/cGSo3wCoVWOWDWR5nW58uwGnqtCkMW6vyW7WjeSoIwmkDW7JcUCkkWP3dSK4gtCo4W4tdICkjW4xcOsDGb8kUbsRdPCk1W716qgmHWPJdNCkyxCobW5HnyNJcPCkYW6ZcVY8GvfnUW6pdOILgdHZdSCkpm8k0W5GFrCoGW7XaAZdcJaSosCo1fSkhWRPNW5DsACkNtSodDCkGD8kbctKlwhf8W7i+W5nynYBdHmkpW7dcQhJdQmocW7VdRCkNWQpdKeBdGvdcN8kEagddH8kCgmoIWQtcIbtdNNRcL8o6WQ5+WONcR8k1W7pcJSkOW49WeCkUW5GJW4RcPgFcShTszWFdKZWLWOSJW6eNW6GLWQnik8kgW5H0W5O+WOLezSouW4G0W7ZdNxicWPHYsmk2W5D6bNxdI8kYhCoVW41sDmkzj8o6Dtj8amk3WPWFWO/dL8oGF8oTbvyCWRFdImoBWOvmDcudv8oeECkjW5ymW4uDWQtcGZJdI1/cR8kwhLnSbIzpWPZcGcVdU10GgIdcQZnkWRZdLqmDtf9cCq','qgFdH8o0WQBdGSoihqizv8oWit56fxhcOuRdQSownConBHnsCCkcWPNcOmktrblcU8ogdZ9TW6e2pSkRsI3cMrWzWR9RW5zdoHddPSkgWOzHWR8JWPSwcmoufX/dQWuwW7GsW7ldOgiaWQ7cQ8kgiSkSpSkzWRdcUmoyq8oSW57cOhP6W6JcSCoIWPe','y8kXW6RdLW','CL93dG','pCotBW','EJP8c8obnmkiWR5dWQxdOSoLA8kC','wmkVgCkUe17dNCkqW64','EmkpqW','WOpcP8kMWPddHqi','WQLxamkGESkLqmk7WPq','e8oiW588WPSXxXy','rH7dSvC','x8otW4NdIc7cIIxdItq','FCkqyJyvkW','D8k3W6KBW7xcMaq','WOW2W58S','WRTZW7ysmmoTWPddSSk9v8oYACksra','zIZdUa','cCk5qCkJW514WOFdGq','WP7cT8k/','ASoCW585W5q2vLDFWPFcNepcGWT/W5tcVbmLdLZdSX7dUwXNvCklWQFdNH/cVCk8qIuIWO7dLqe','rGBdPurtfW','m8okW4qGWOy','WOL5WPOInSoGACkDCSkOW63dLs0PW7BdUHVcOGtdOCoaWQbFjeSuydFcM1tcTCoKxHtcUCoJW7f4omo/WQakWQtdSvFdPmkYWO7cRW8aWQVcVu7cQ8kEW4dcNvz/aSovBSo4FMhcQ0ddNW7cSCkbW4lcL8okWQ/dVHriw8ofWPxdUCoPWP0+bM8','dGiFWQNdQf7dSCk0','p2S8xCkBACov','DfBcN8kQWPHBle88nJRcKuyBl8ohCCkzdMNdK8koWPFdUCkLWQ/dTf1ZW7NdOxi+uSkn','v1VdHwBdQJKoWOVcOq','WPldJr9CW58ahmolxwpcOSkkW4y','WQldK2C','WOaCW75DW6RdUa','h8k3cN5WuW','jg8MwCkhza','WQ7dNNS','ASkkitaHWQZdJKtcGgOFW53cRq','W4PKWOr+WPaxWPpcPxjVxGTuW7xcGmkCW4WhWQjBrCkYW4jRWQ55WPhdLJSAwCo1','dXmcWRVdTf/dOa','W5VcLsJcS8oujxCYWOFcMGxdMmozW68','EJH5cCodpSkfW71GWRBdL8omua','vmk7WQVdGx9SWPK3WPeUWRfKhrTzW7pcKbreCmkRjSkQWP/cQCo9e1FcM8oUW5D8ncq','W4Tuw8otWPPw','W6TLfCoiW4imWOVdTmouW70Hl00cW6WsWQO8tSklW43dScSVDmkIWOOCW6ZcUCokWO0','gb4FWRNdOG','W4xcJKSkWO9e','iXnTb8kaW5xcGK/dKCoakq/dGqhcJCk4WQ/cSa','WOtcVmkLWPFdKJJdU8oNWQm','g8k0chn8vCkO','WPNcVCk/WPpdJa','yYZdUW','FreSWRr9W43dNgy','W5pcGJxcKCorlG','WP7dG0xcH8ovWP8VWPSJimodW4tdIhRdRSoAm2K5vt/cS13cM8kGWR9tlmkUzSkUW4TMEmoqqmk8pmoMsSkyW63dVaxcVmkXW4Kzm3WDkmo8smkEW5mvW5VdP8k6vIhdVHO+WQxdNJfwymoJrHDiimkqWRaMW7BcHZ/cO8oPa2nyWQ4PjbCh','v10sWRpdSqq','WOy2W5mXWPztWPxcUG','i8kEv8ktWORdISo8fc/cMCk/m8oCW7rkdt93FokbVmkhlSkzF8o6kw/cJ8k+WO0Bn8ocjSo8WRVdJYdcMCogr8kdW71AwJFcKCkBW7RdRSkP','DLjWbW','W5L1W6pdHxNcLGi','Ft/dVCoalmoVWQC','oGWWWQCIW6FdVeuD','AYykW6K','ECkqW5agWRVcMsddNmkjW7eJs2GAzfqMW4pdImk5y2ZdQ8kfgSk5WQhdT0dcMNtcP2/cVq','W5xcNJlcK8okce4AWQu','W4tcR8oupmoEWPKWbmkaWRTRkmkI','pSoDAa','r8oRz0rbWQj0','W5pdSmoEgCkqjSkMW7zD','fSkHCf5wW7S','zJNdV8kDFG','W6TYdmoFWOXpWOtdUCogW71VmaOdW6XgWRKtq8ksWOpcQHzTCSo0WOmbW77dP8oyWOlcTSo2WQThW6K','wrpdPLvk','qgFdKmoTWRhcKSo8nWizv8oWit56fxhcOuRdTSkoomosoebfzmkpWO/dRSkmcWpcPCoah3WVW6n7CmkTeJxcIGHAW7iKWOKupa3cPmkyW4PJWQPVWOSmr8kvgq7cQe4pW7GFWQNdVh5aWQNdTSowzmkRpmosWQZdQ8khqSoRW7VdUWiZWQ3dOSoQWPzqhqDAW6WkE1jHsSkwWQJcM8orWRhcT0inW6u','f07cQ1rpeSk6W6bYWQxdKHnTe8kRW7SdfCoHCrXqsSo3sa','W7uHgmoFWPyoW4RdVmkAWQW','qmk8fSoyW7lcRcWGWQnibZT2W7FdN0aQW4Oyemo5EmoribdcPSkn','WQrygSkK','WPPUWPyMF8oMDSot','W5xcSCoemCouW4yOamkFWQLcomoCWRCdW7pdQCk/AmkuzmoobZFcJSkkdCk0vCkLFutcTxm3iGldNxi','cSozW47dM3ZcOr3dPqVdVxjTW6GxlxSdWOy','WOG7bNaaW6v3kSkPW7iEWOa','W6izd8kPFmoqnSouW7GDWPSufuRcJ8kUWO1WWP0hW75zie19CtPhW6FcR8omjxv+WRJdG8oFWQqRhhpcIapdMSkXybhcGd55v8kDW4XZmuVcLWZcJLusaZVcLhzIpNZdMeJcPSomWRRdLhmhxtzSW6nwW5VdV1zZrgJcVKVdT8oNWQFdTSopWPxdJSkse3zKW55fWRBcMWyG','W5hcOCk7WPpdJLddJmogWO5tW75jACkVD0SFnmoFhJCQfSosi8oRemoyWRWa','DSkXW6xdGN5M','jSkWW6ldKYPTW5u3WPq8W6uQgqThWRtcJG','j8kTy2FcQtNdTa','zCkxstD8WRWyW5Wz','dSo8WO7cVG','lLddJCkmWPvznW','W4X4WPiM','WRL0WPtdVcVcHa','W518WOahy8oH','WQpdI04','tmkYW4ZdQaKPWR8iWOhdJmo/WQ3cSG','WOysW6fCW6RdUq','W7O6gczYW6n3lSk7W7jgW5hcL0lcP8kdWP8qEw0RvxTjxrXeW7tcNYRdT8ouW6HK','W5xdRmozg8klaa','cmoQaSou','uH1W','lmkHewXYuSkOfq','WPy2W6xdKG','qmk8gSkaWRRcMayGWQnibZT2W7FdN0aQW4Oyemo5EmoribdcPSkra8oktSorbhGJWQfCWQ3cRgmIiSo7zsy','nCkBW4OeW77cIa','W6hcSaFcQ8omaa','W4lcSmk5WP3dLWpdISkvWOHfW6mglSoWreavmmktqWe','ttqL','vCo2WPVcQvz6W7ra','cSkWdhX1','b8kHcSk4av/dRCoDW7hdRapdPai','pubYcmknWOFcUfNdMmobjaVdKbtcGmoU','W7RdGuhdQW','CCkAwdDKWOWjW58ohSoBmCkqzmkzxq','DCkeCW','fsBdK8oOWQq','gv3dQvaTWOhcUMboDSkrWQxdKbBcJtDyyJddGL3cKwddQhb6E3G','kCkhe2/cQZRdJ8kqWO10WQiEwr4Ag8o3W4KnW4ddL8k8WRziWPTCydZdI1ueW5/dQmozW7NdJZ9fWRFdNmkMWRmtW7uHfSk/bSkOaCosW5RIGPRcUCo1WQDZWQNcNmoj','WQ7dNh4KWPJdRa','s8oGFuruWRD0W4Gu','W6tcSaFcOCokaHC','lf7dI8kO','CCkCD2P3W7BcL2tcOa50W6lcISkwD3a8WOW','jSkNW7VdHgqUW5O6WOy8WQS1xGPqW7pdNLavpSoICSkHWPRcU8kUbrRdKmoVW5e1mMjbW6NcMmoODmkzmSotfCopcevqyvFcLZpcG1NcKmk/us1BkmkTaSk2W60','E8kBxM7cOIK','WOVcPSkftmoAwSohW7DsahiQjq','u1ldKfddTrakWP3cUZOFWRTZW6W','WOBdUSozcSocdCkEW5PIkJDAlY5GWQnK','rSosW5tdMtNcSa','WQ5ma8kNBCkF','ehC6EaFcNdq','trucW6e','kCkDq23cQxVdN8kpW5eLWQnkvGebg8oHWO5b4PUOW4m','uSkktJbWWRPmW7yBxq','W6yXs8kjW5rEW5tdO8oHW4LRxvW','ECk1W7/dHMi','E8k3gCkLaGZdN8kdW7BdObNdUvea','W4tcPCowW4Tf','WQhdNxKQ','WPRcGsNcMComEW','r8kbxM3cQtJdMq','wbFdT0nha8oH','dSkxvCouWO3dHW','r8kTfmk4f0G','WQS7aImZW6D+','xfBdL1hdRbC','uX7dOuG','WRaJW4G0WPXfW5a','W5zXWPy1za','WQ17W6ycoq','iHC7WRaPW7ZdJwq0p8k6WRHfhuZcIa','W6tdGvtdNbPYW4nOBmoKWOuKWQxcVW','v10sWRpdSqtcQmoOW7XahYe','tSkIeCk7','xSkVf8k2eG','W5hcKsW','WQTSW6tcVhVcLCofnsrwWQFcMedcRa','WO8JW5qLWO1F','haTXWQSyhLG','wuj+W6jWWO/cIcHXymoHWRnEkH4','W57dT8oddmkod8kl','W5NcJKVcJCoq','nCoqFxW','lCkvEdrWomo4vvRdGwfyELr4WORcOKCsW7DiW7NdVHrgWP3dLmo0WQPUWOZdHY3dMMHswNFcPW','W4/cKLuyWOzxvq','CIWx','qSopW47dGa','n8oDBgu','ru3dUa','fmkWcmk2gbi','ec3dJCo6WQtcLa','p8owW5GQWOyDBNTG','zSkqzse4pSoW','W5pcPmon','eLVcPG4As8oGWRvGW7lcMbXQfSk8WRz6cmoJnK4zdSo1vJuXrSkocmoDW5BdKCoyxmoeW5W5pe4npSoHW60FDMVdVmkCbHZdOmkcthBdQ8oic8kacxZdVCo4jSoMgSkqC8opWRxdMxymfsuLW4FdTSkeW5KiWQxdSmolW65rE8oCpmkeeW4iW68','fmkBxSoe','kCobv2xcSwu'];_0x27a7=function(){return _0x5b51e1;};return _0x27a7();}const _0x2e7ea5={};_0x2e7ea5['&']=_0x409976('3Sz(',0x175),_0x2e7ea5['<']='&lt;',_0x2e7ea5['>']=_0x409976('fDPe',0xfc),_0x2e7ea5['\x22']=_0x3f3971(0x42,'CI&(');const API='/api/anime',view=document[_0x409976('8pSr',0x131)](_0x409976('h9&)',0x128)),esc=_0x548059=>String(null==_0x548059?'':_0x548059)[_0x3f3971(0x11a,'zpPw')](/[&<>"]/g,_0x2716a1=>_0x2e7ea5[_0x2716a1]);let hls=null;function _0x4e47(_0x370110,_0x4cc053){_0x370110=_0x370110-(0x1f0b+-0x1cd*0x13+0x7*0x95);const _0x180da6=_0x27a7();let _0x5cdd9b=_0x180da6[_0x370110];if(_0x4e47['MUUXCQ']===undefined){var _0x54a27b=function(_0x2cddc7){const _0x142f0c='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=';let _0x4f2dac='',_0xb73edf='';for(let _0x2ce448=-0x1f8a+0xfae+0x74*0x23,_0x29b257,_0x281c55,_0x5d59ee=-0x1e07+-0x13*0x3b+-0x6*-0x5bc;_0x281c55=_0x2cddc7['charAt'](_0x5d59ee++);~_0x281c55&&(_0x29b257=_0x2ce448%(0x59*0xa+0x537*0x1+-0x1*0x8ad)?_0x29b257*(-0x1f69+0x4*-0x6d+0x9*0x3b5)+_0x281c55:_0x281c55,_0x2ce448++%(-0xe1e+-0x8d*0x43+0x3309))?_0x4f2dac+=String['fromCharCode'](0x1666+-0x1565+-0x2&_0x29b257>>(-(-0x1*-0x2209+-0x519+-0x1cee)*_0x2ce448&0x2442+0x1f04+0x40*-0x10d)):0x7*-0x567+0x2035+0x2*0x2ce){_0x281c55=_0x142f0c['indexOf'](_0x281c55);}for(let _0x1a2f7f=-0x6b+-0x1*0x11bf+0x122a,_0x3db7c1=_0x4f2dac['length'];_0x1a2f7f<_0x3db7c1;_0x1a2f7f++){_0xb73edf+='%'+('00'+_0x4f2dac['charCodeAt'](_0x1a2f7f)['toString'](-0xe*0x167+-0x3*0x6ad+0x1*0x27b9))['slice'](-(-0xa76+-0x20c9+0x2b41));}return decodeURIComponent(_0xb73edf);};const _0x2b098=function(_0x15e181,_0x21510f){let _0x59ae26=[],_0x2ad5eb=-0x1*-0x1089+0x1337*-0x1+0x62*0x7,_0x277418,_0x4a1eb1='';_0x15e181=_0x54a27b(_0x15e181);let _0x2c6ec9;for(_0x2c6ec9=-0x33e+0x1*-0x1285+0x9*0x26b;_0x2c6ec9<-0x2bb+-0x1c1d+0x1fd8;_0x2c6ec9++){_0x59ae26[_0x2c6ec9]=_0x2c6ec9;}for(_0x2c6ec9=-0xe1d+0x1c9c+-0x3*0x4d5;_0x2c6ec9<0x2f*0x43+-0x150b*-0x1+-0x2058;_0x2c6ec9++){_0x2ad5eb=(_0x2ad5eb+_0x59ae26[_0x2c6ec9]+_0x21510f['charCodeAt'](_0x2c6ec9%_0x21510f['length']))%(0x1*0x13df+-0x3*0x8c3+0x2*0x3b5),_0x277418=_0x59ae26[_0x2c6ec9],_0x59ae26[_0x2c6ec9]=_0x59ae26[_0x2ad5eb],_0x59ae26[_0x2ad5eb]=_0x277418;}_0x2c6ec9=-0x8*0x3e9+-0xa0c+0x2954,_0x2ad5eb=0xb58+0x379*-0x4+0x28c;for(let _0x132b67=-0xcb9*-0x3+0x1c9c+-0x42c7;_0x132b67<_0x15e181['length'];_0x132b67++){_0x2c6ec9=(_0x2c6ec9+(-0x26a7*0x1+-0x1d5f+0x4407))%(0x1d7b+-0x2fb*0x9+-0x4*0x6a),_0x2ad5eb=(_0x2ad5eb+_0x59ae26[_0x2c6ec9])%(-0x1*0xd72+0x1*0x7c9+0x6a9),_0x277418=_0x59ae26[_0x2c6ec9],_0x59ae26[_0x2c6ec9]=_0x59ae26[_0x2ad5eb],_0x59ae26[_0x2ad5eb]=_0x277418,_0x4a1eb1+=String['fromCharCode'](_0x15e181['charCodeAt'](_0x132b67)^_0x59ae26[(_0x59ae26[_0x2c6ec9]+_0x59ae26[_0x2ad5eb])%(0x1*0x1467+-0x1*-0x183b+0x2ba2*-0x1)]);}return _0x4a1eb1;};_0x4e47['xlLuXK']=_0x2b098,_0x4e47['rYGhtw']={},_0x4e47['MUUXCQ']=!![];}const _0x2fb8dd=_0x180da6[-0xe7a+0x3d*0x2c+0x3fe],_0x503787=_0x370110+_0x2fb8dd,_0x19d891=_0x4e47['rYGhtw'][_0x503787];return!_0x19d891?(_0x4e47['nQWKlN']===undefined&&(_0x4e47['nQWKlN']=!![]),_0x5cdd9b=_0x4e47['xlLuXK'](_0x5cdd9b,_0x4cc053),_0x4e47['rYGhtw'][_0x503787]=_0x5cdd9b):_0x5cdd9b=_0x19d891,_0x5cdd9b;}const watchMap=new Map();async function loadProgress(){const _0x1802c2={_0xade28d:'1rkn',_0x26e0d8:0xaa,_0x2afa0d:'Zbtq',_0x85be1b:0x43e,_0x47e797:'TmjW'},_0x340c48={_0x1b149e:'xUiG',_0x5aecb8:0x9d,_0x31b8b7:'&ekc'},_0x218cda={_0x3eeb86:0xa4},_0x5c170f={_0x4d5118:0x3f3},_0x174c37={_0x42a582:0x63};function _0x4f30cc(_0x383d7d,_0x4250ef){return _0x3f3971(_0x4250ef- -_0x174c37._0x42a582,_0x383d7d);}function _0x29b032(_0x343f3d,_0x35348d){return _0x3f3971(_0x35348d-_0x5c170f._0x4d5118,_0x343f3d);}try{const _0x123b54=await SerumSync[_0x4f30cc(_0x1802c2._0xade28d,_0x1802c2._0x26e0d8)]('anime_progress');watchMap[_0x29b032(_0x1802c2._0x2afa0d,_0x1802c2._0x85be1b)](),Object[_0x4f30cc(_0x1802c2._0x47e797,0xa7)](_0x123b54)['forEach'](_0x9295b9=>{function _0x42f717(_0x188dc0,_0x1d8b11){return _0x4f30cc(_0x1d8b11,_0x188dc0- -0x4b);}function _0x189191(_0xfe8a43,_0x27f1c9){return _0x4f30cc(_0x27f1c9,_0xfe8a43-_0x218cda._0x3eeb86);}_0x9295b9&&_0x9295b9[_0x42f717(0x41,_0x340c48._0x1b149e)]&&watchMap[_0x189191(_0x340c48._0x5aecb8,'uf1Q')](_0x9295b9[_0x189191(0xb8,_0x340c48._0x31b8b7)],_0x9295b9);});}catch{}}function getProg(_0x3c52f1){const _0x241574={_0x3bdf86:'#eB1'},_0x2af1e5={_0x4a31e6:0x345};function _0x55c487(_0x5572ff,_0x2eb48f){return _0x3f3971(_0x2eb48f-_0x2af1e5._0x4a31e6,_0x5572ff);}return watchMap[_0x55c487(_0x241574._0x3bdf86,0x3b7)](_0x3c52f1);}function markWatched(_0x2822e2,_0x374ed6,_0x77beba){const _0x33e292={_0x408323:0xf4,_0x7e2f6e:0x8b,_0x1f33de:'KjZq',_0xe03512:'900F',_0x21e2d2:'%Ea5',_0x2b3a12:0xc3,_0x5677b5:'[5[d',_0x288e42:0x14b,_0x56968c:'@XZS',_0xf9443d:0xe4,_0xaea07a:'yV3o',_0x40d4c5:0x83,_0x25c63d:'yV3o'},_0x4a9499={_0x5f013f:0x182},_0x4835f2={_0x177f92:0x170},_0x5f3df1={};function _0x669c2(_0x2b74ba,_0x10f52a){return _0x3f3971(_0x2b74ba- -_0x4835f2._0x177f92,_0x10f52a);}function _0x2756f8(_0x1d40ee,_0xb8731e){return _0x3f3971(_0x1d40ee- -_0x4a9499._0x5f013f,_0xb8731e);}_0x5f3df1[_0x669c2(-_0x33e292._0x408323,'s4Qf')]=[];const _0x32cc47=curSeries&&curSeries[_0x2756f8(-_0x33e292._0x7e2f6e,_0x33e292._0x1f33de)]===_0x2822e2?curSeries:null,_0x1c46df=watchMap['get'](_0x2822e2)||_0x5f3df1,_0x3b141b=new Set(_0x1c46df['watched']||[]);_0x3b141b[_0x2756f8(-0x167,_0x33e292._0xe03512)](_0x374ed6);const _0xbd60d3={'slug':_0x2822e2,'title':_0x32cc47&&_0x32cc47[_0x2756f8(-0x10d,_0x33e292._0x21e2d2)]||_0x1c46df[_0x2756f8(-_0x33e292._0x2b3a12,_0x33e292._0x5677b5)]||_0x2822e2,'poster':_0x32cc47&&_0x32cc47[_0x2756f8(-_0x33e292._0x288e42,_0x33e292._0x56968c)]||_0x1c46df[_0x669c2(-_0x33e292._0xf9443d,'1LsU')]||'','lastEp':_0x374ed6,'dub':!!_0x77beba,'watched':[..._0x3b141b],'total':_0x32cc47&&_0x32cc47['episodes']&&_0x32cc47[_0x2756f8(-0xfe,'(5$z')][_0x2756f8(-0x176,'!VRW')]||_0x1c46df[_0x2756f8(-0x67,_0x33e292._0xaea07a)]||0x1601+-0x1e07+-0x1a*-0x4f,'ts':Date[_0x2756f8(-0x92,'%Ea5')]()};watchMap[_0x2756f8(-_0x33e292._0x40d4c5,_0x33e292._0x25c63d)](_0x2822e2,_0xbd60d3);try{SerumSync[_0x669c2(-0x9b,'3Sz(')]('anime_progress',_0x2822e2,_0xbd60d3);}catch{}}function _0x409976(_0xfc9639,_0x206bfa){return _0x4e47(_0x206bfa- -0x30,_0xfc9639);}function contCard(_0x2bf29c){const _0x453f23={_0x23d617:0x209,_0x4d78c5:'T(U!',_0x36d852:'pkpz',_0x5c9b7a:0x127,_0x5084b3:'TmjW',_0x12e6d0:'[2K6',_0x5be50e:'T(U!',_0x59dd07:'y^Wp',_0x424f45:0x1e8,_0x583f00:'yV3o',_0xca803c:0x1ef},_0x5f369d={_0x2f17bd:0x4e},_0x40f027=_0x2bf29c[_0x46e77f(0x174,'fr3o')]?_0x46e77f(0x123,'(*hA'):'';function _0x46e77f(_0x5432c5,_0x51eb27){return _0x409976(_0x51eb27,_0x5432c5-_0x5f369d._0x2f17bd);}function _0x4380bc(_0xa7dad1,_0x119f09){return _0x409976(_0xa7dad1,_0x119f09- -0x37b);}return _0x46e77f(0x128,'1LsU')+esc(_0x2bf29c['slug'])+'\x27,'+_0x2bf29c[_0x46e77f(_0x453f23._0x23d617,_0x453f23._0x4d78c5)]+','+!!_0x2bf29c['dub']+_0x46e77f(0x1ca,_0x453f23._0x36d852)+esc(_0x2bf29c[_0x46e77f(_0x453f23._0x5c9b7a,_0x453f23._0x5084b3)])+_0x46e77f(0x22f,_0x453f23._0x12e6d0)+_0x2bf29c[_0x4380bc(_0x453f23._0x5be50e,-0x1c0)]+_0x46e77f(0x111,_0x453f23._0x59dd07)+esc(_0x2bf29c[_0x4380bc('uf1Q',-_0x453f23._0x424f45)])+_0x4380bc(_0x453f23._0x583f00,-0x1f8)+_0x40f027+_0x4380bc('KnmC',-0x24e)+_0x2bf29c[_0x4380bc('KnmC',-_0x453f23._0xca803c)]+'</div>\x0a\x20\x20\x20\x20</div>';}async function api(_0x4ebb8e){const _0x5c8998={_0x45fe54:'dF)o',_0x4d0638:0x4cd,_0x4e297a:'&ekc',_0x2bf49d:0x17},_0x363b73={_0xaa22b6:0x109},_0x5f15d2=await fetch(API+_0x4ebb8e);if(!_0x5f15d2['ok'])throw new Error(_0x2cde95(_0x5c8998._0x45fe54,_0x5c8998._0x4d0638)+_0x5f15d2[_0x5bd623('KjZq',0xba)]);function _0x2cde95(_0x66da0,_0x396fb9){return _0x409976(_0x66da0,_0x396fb9-0x40d);}const _0x34d9d2=await _0x5f15d2['json']();if(!_0x34d9d2['ok'])throw new Error(_0x34d9d2[_0x2cde95(_0x5c8998._0x4e297a,0x5d1)]||_0x5bd623('1rkn',0x92));function _0x5bd623(_0x38e290,_0x39685c){return _0x409976(_0x38e290,_0x39685c- -_0x363b73._0xaa22b6);}return _0x34d9d2[_0x5bd623('%Ea5',_0x5c8998._0x2bf49d)];}function card(_0x3c6bf1){const _0x2b4e08={_0xf97a56:0x3f5,_0x2a2271:0x428,_0x197db6:0x68,_0x3870c1:0x8d,_0x3cf6e2:'s4Qf',_0x372671:0x3ea,_0x59278d:'pkpz',_0x17aa40:'T(U!',_0x463d85:0x361,_0x3cf6fe:0x69,_0x4bbcb9:'H(L^',_0x126835:0x3c9,_0xddf16b:'&ekc',_0x48f47e:0x36f,_0x1e1188:'fiA3',_0x16071b:'900F',_0x470f79:0x39f},_0x2f08e3=_0x3c6bf1['year']?''+_0x3c6bf1[_0x2cae05('!VRW',_0x2b4e08._0xf97a56)]+(_0x3c6bf1[_0x2cae05('8pSr',_0x2b4e08._0x2a2271)]?_0x3b3535('b@F[',-_0x2b4e08._0x197db6)+_0x3c6bf1[_0x3b3535('yV3o',-_0x2b4e08._0x3870c1)]+_0x2cae05('fr3o',0x398):''):_0x3c6bf1['episodes']?_0x3c6bf1[_0x2cae05(_0x2b4e08._0x3cf6e2,_0x2b4e08._0x372671)]+_0x2cae05(_0x2b4e08._0x59278d,0x381):'';function _0x2cae05(_0x48cf58,_0x32bddd){return _0x409976(_0x48cf58,_0x32bddd-0x245);}function _0x3b3535(_0x2ca049,_0x55d1a7){return _0x409976(_0x2ca049,_0x55d1a7- -0x1f1);}return _0x2cae05(_0x2b4e08._0x17aa40,_0x2b4e08._0x463d85)+esc(_0x3c6bf1[_0x3b3535('3mNV',-_0x2b4e08._0x3cf6fe)])+_0x2cae05(_0x2b4e08._0x4bbcb9,_0x2b4e08._0x126835)+esc(_0x3c6bf1[_0x2cae05('1LsU',0x393)])+_0x3b3535(_0x2b4e08._0xddf16b,-0xc2)+(!(0x1*0x1ad2+0x241*-0x5+0xf8c*-0x1)!==_0x3c6bf1[_0x2cae05('TsGN',_0x2b4e08._0x48f47e)]?_0x3b3535('yV3o',-0x124):'')+'\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22play-ov\x22><i\x20class=\x22ri-play-circle-fill\x22></i></div>\x0a\x20\x20\x20\x20\x20\x20\x20\x20</div>\x0a\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22nm\x22>'+esc(_0x3c6bf1['title'])+'</div>\x0a\x20\x20\x20\x20\x20\x20\x20\x20'+(_0x2f08e3?_0x2cae05(_0x2b4e08._0x1e1188,0x39a)+esc(_0x2f08e3)+'</div>':'')+_0x2cae05(_0x2b4e08._0x16071b,_0x2b4e08._0x470f79);}function rowEl(_0x4c7173,_0x2bc7ac){const _0xb7ebd8={_0x26d22e:'h9&)',_0x4a8522:0x3d2,_0x278cc6:'KjZq',_0x3e79a7:0x3ec,_0x536cbf:'ZR%e'},_0x3d1254={_0xa43f23:0x33e};function _0x490357(_0x1082b5,_0x2ed1a4){return _0x3f3971(_0x1082b5- -0xbe,_0x2ed1a4);}function _0x28894e(_0x1248e2,_0x428040){return _0x3f3971(_0x1248e2-_0x3d1254._0xa43f23,_0x428040);}return _0x2bc7ac&&_0x2bc7ac[_0x490357(-0x79,_0xb7ebd8._0x26d22e)]?'<div\x20class=\x22row\x22>\x0a\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22rhead\x22><span\x20class=\x22bar\x22></span><h2>'+esc(_0x4c7173)+_0x28894e(_0xb7ebd8._0x4a8522,_0xb7ebd8._0x278cc6)+_0x2bc7ac[_0x28894e(0x45a,'dF)o')](card)[_0x28894e(_0xb7ebd8._0x3e79a7,_0xb7ebd8._0x536cbf)]('')+'</div>\x0a\x20\x20\x20\x20</div>':'';}function setNav(_0x134f53){const _0x4c12ce={_0x24fe44:0x49,_0x37de64:'fiA3',_0x48ead7:0xd2,_0x422b00:0x425},_0x287ba6={_0x48992e:0x4};function _0x53389f(_0x4bea4b,_0xf39d50){return _0x3f3971(_0x4bea4b-0x38e,_0xf39d50);}function _0x115d65(_0x254519,_0x57484f){return _0x3f3971(_0x57484f- -_0x287ba6._0x48992e,_0x254519);}document[_0x115d65('[5[d',_0x4c12ce._0x24fe44)](_0x115d65(_0x4c12ce._0x37de64,_0x4c12ce._0x48ead7))[_0x53389f(_0x4c12ce._0x422b00,'2B7M')](_0x4d4b9a=>_0x4d4b9a[_0x115d65('@1mX',0x103)][_0x115d65('%Ea5',0xa6)]('on',_0x4d4b9a['id']===_0x134f53));}function skelGrid(_0x1f1547=0xab4+-0xe1e+0x378){const _0x3da033={_0x93c383:0x10e};function _0x1fbd7f(_0x3124ac,_0x276ebc){return _0x409976(_0x276ebc,_0x3124ac- -0x21f);}return'<div\x20class=\x22sk-wrap\x22><div\x20class=\x22sk\x20sk-title\x22\x20style=\x22margin-bottom:16px\x22></div><div\x20class=\x22sk-grid\x20posters\x22>'+'<div><div\x20class=\x22sk\x20sk-poster\x22></div><div\x20class=\x22sk\x20sk-text\x20sk-w70\x22\x20style=\x22margin-top:8px\x22></div></div>'['repeat'](_0x1f1547)+_0x1fbd7f(-_0x3da033._0x93c383,'fDPe');}function skelHome(){const _0x4414e7={_0x7c87a0:0x75,_0x5839d9:'8pSr',_0x432090:0x19,_0x80805b:'2B7M'},_0x20e730={_0x36a1bf:0xb6};function _0x4806cc(_0x1709f3,_0x331856){return _0x3f3971(_0x1709f3-_0x20e730._0x36a1bf,_0x331856);}function _0x125736(_0x588f1b,_0x52a9b3){return _0x3f3971(_0x52a9b3- -0x8e,_0x588f1b);}return _0x125736('Zbtq',_0x4414e7._0x7c87a0)+(_0x125736('CI&(',0x42)+'<div\x20class=\x22sk-poster-tile\x22><div\x20class=\x22sk\x20sk-poster\x22></div></div>'[_0x125736(_0x4414e7._0x5839d9,_0x4414e7._0x432090)](0x1*0x1712+0x11fb+-0x2905)+_0x125736(_0x4414e7._0x80805b,0x2b))[_0x125736('fDPe',0xc)](-0x14aa+0x32a+-0x1183*-0x1)+'</div>';}async function goHome(){const _0x368fc0={_0x18248c:'yV3o',_0x41f3e7:0x1c7,_0x2145dd:0x1be,_0x9a515:'Ze%@',_0x33d733:'!VRW',_0x55868c:0x1c5,_0x2ff7fc:'zpPw',_0x5dcd98:0x255,_0xf2e638:'yV3o',_0x6e9999:'$RRG',_0x3a8933:0x1ce,_0x19dbf5:0x1e1,_0x1325f2:'@XZS',_0x571c03:0x1ef,_0x12913f:'[2K6',_0x2787b0:0x1e6,_0x23a53b:'Ze%@',_0x4ffe00:0x1e0,_0x9cdfd:'2B7M',_0x5d891b:0x220,_0x322978:'Q@t3',_0x2d6b48:'#eB1',_0xc75f28:0xd4,_0x465815:0x1ec};setNav('nav-home'),view[_0x5079cf(-0x15d,_0x368fc0._0x18248c)]=skelHome();function _0x5079cf(_0x29f324,_0x46ab8e){return _0x409976(_0x46ab8e,_0x29f324- -0x338);}function _0x2bea0c(_0x2784c6,_0x22adb8){return _0x409976(_0x22adb8,_0x2784c6- -0x2ab);}try{const [_0x457edb,_0x3877f4,_0x430814,_0xe48755]=await Promise[_0x2bea0c(-_0x368fc0._0x41f3e7,'b@F[')]([api(_0x2bea0c(-0x194,'900F'))[_0x2bea0c(-0x13e,'E5fs')](()=>[]),api(_0x2bea0c(-_0x368fc0._0x2145dd,_0x368fc0._0x9a515))[_0x5079cf(-0x238,_0x368fc0._0x33d733)](()=>[]),api('/browse?genre=Action')[_0x2bea0c(-_0x368fc0._0x55868c,_0x368fc0._0x2ff7fc)](()=>[]),api(_0x5079cf(-_0x368fc0._0x5dcd98,_0x368fc0._0xf2e638))[_0x2bea0c(-0x146,_0x368fc0._0x6e9999)](()=>[])]),_0x5bb645=_0x3877f4[-0x163f+-0x2*0x9de+-0xb*-0x3d1]||_0x457edb[0x577*-0x1+-0x2120+0x2697],_0x388ed6=[...watchMap['values']()][_0x5079cf(-_0x368fc0._0x3a8933,'h9&)')]((_0xe26d9f,_0x10dc59)=>_0x10dc59['ts']-_0xe26d9f['ts'])[_0x5079cf(-0x1d7,'29dG')](0x25d2+0x7f*0x25+-0x49*0xc5,0xc9c+0xcba+-0x1948);let _0x46b14f='';_0x5bb645&&(_0x46b14f+=await heroFor(_0x5bb645)),_0x46b14f+=_0x2bea0c(-_0x368fc0._0x19dbf5,_0x368fc0._0x1325f2),_0x388ed6[_0x2bea0c(-0xdd,'ZR%e')]&&(_0x46b14f+='<div\x20class=\x22row\x22><div\x20class=\x22rhead\x22><span\x20class=\x22bar\x22></span><h2>Continue\x20Watching</h2></div><div\x20class=\x22scroller\x22>'+_0x388ed6[_0x2bea0c(-_0x368fc0._0x571c03,'%Ea5')](contCard)['join']('')+_0x2bea0c(-0x10b,_0x368fc0._0x12913f)),_0x46b14f+=_0x5079cf(-_0x368fc0._0x2787b0,_0x368fc0._0x23a53b)+rowEl(_0x2bea0c(-_0x368fc0._0x4ffe00,'1LsU'),_0x457edb)+'\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20'+rowEl('Popular\x20Now',_0x3877f4)+_0x5079cf(-0x19a,_0x368fc0._0x9cdfd)+rowEl(_0x2bea0c(-0x129,'2B7M'),_0x430814)+_0x5079cf(-0x1bb,'&ekc')+rowEl(_0x5079cf(-0x233,'29dG'),_0xe48755)+_0x5079cf(-_0x368fc0._0x5d891b,'[5[d'),view[_0x2bea0c(-0x150,_0x368fc0._0x322978)]=_0x46b14f;}catch(_0x292120){view[_0x5079cf(-0x181,_0x368fc0._0x2d6b48)]=_0x2bea0c(-_0x368fc0._0xc75f28,'s4Qf')+esc(_0x292120[_0x5079cf(-_0x368fc0._0x2145dd,'CI&(')])+_0x2bea0c(-_0x368fc0._0x465815,'bK$w');}}async function heroFor(_0x11d2fb){const _0x19b0bb={_0x23bf83:'Zbtq',_0x1bc813:0x26c,_0x35e2b1:'KnmC',_0x2b5c0c:'TmjW',_0xc0e015:0x1f,_0x20fb4a:0x2ec,_0x4b37c2:'*gHM',_0x14d121:'E5fs',_0x217d0a:0x31c,_0x43f022:'ErGD',_0x52a195:0x5b,_0x2b09f9:'fDPe',_0x2738c3:0x36a,_0x23701f:0x5b,_0xd68ce5:0x353,_0x2ac997:'1LsU',_0x18d21b:0x26},_0x298166={_0x1276af:0x1a4},_0xd98f7={_0x236c07:0x17d};function _0x4c2a7f(_0x3179ad,_0x43c1ec){return _0x409976(_0x3179ad,_0x43c1ec- -_0xd98f7._0x236c07);}function _0x52342a(_0x406410,_0x310572){return _0x409976(_0x406410,_0x310572-_0x298166._0x1276af);}let _0x16139d='',_0x36cc8a='';try{const _0x48f130=await api(_0x52342a(_0x19b0bb._0x23bf83,_0x19b0bb._0x1bc813)+encodeURIComponent(_0x11d2fb['slug']));_0x16139d=_0x48f130['description']||'',_0x36cc8a=_0x48f130['rating']||'';}catch{}return'<div\x20class=\x22hero\x22>\x0a\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22bg\x22\x20style=\x22background-image:url(\x27'+esc(_0x11d2fb[_0x4c2a7f(_0x19b0bb._0x35e2b1,-0x9c)])+_0x4c2a7f(_0x19b0bb._0x2b5c0c,-_0x19b0bb._0xc0e015)+esc(_0x11d2fb['title'])+_0x52342a('(5$z',0x304)+(_0x36cc8a?_0x52342a('ErGD',_0x19b0bb._0x20fb4a)+esc(_0x36cc8a)+_0x4c2a7f('@1mX',-0x20):'')+(_0x11d2fb[_0x4c2a7f('Zbtq',-0xa9)]?'<span>'+esc(_0x11d2fb[_0x52342a(_0x19b0bb._0x4b37c2,0x28d)])+_0x52342a('TsGN',0x38a):'')+(_0x11d2fb[_0x52342a(_0x19b0bb._0x14d121,_0x19b0bb._0x217d0a)]?_0x4c2a7f(_0x19b0bb._0x43f022,-_0x19b0bb._0x52a195)+esc(_0x11d2fb[_0x52342a(_0x19b0bb._0x2b09f9,_0x19b0bb._0x2738c3)])+'\x20episodes</span>':'')+'</div>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22desc\x22>'+esc(_0x16139d)[_0x4c2a7f('fDPe',_0x19b0bb._0x23701f)](0x7ae+-0x147+-0x667,-0x2f*-0x2f+0x1*-0x118c+0xa03)+_0x52342a('y^Wp',_0x19b0bb._0xd68ce5)+esc(_0x11d2fb['slug'])+_0x4c2a7f(_0x19b0bb._0x2ac997,-_0x19b0bb._0x18d21b);}async function goRecent(){const _0x4ec385={_0x48ce26:0x182};function _0x37dd5c(_0x4e3193,_0xee2137){return _0x3f3971(_0xee2137-_0x4ec385._0x48ce26,_0x4e3193);}setNav('nav-recent'),await renderGrid(_0x37dd5c('$RRG',0x23f),'/recent');}async function goBrowse(_0x18be95,_0x44000a){const _0x487b98={_0x1cacb5:'ErGD'},_0x32c88d={_0xcf7e28:0x110};function _0x2566ca(_0x325f7b,_0x5c3593){return _0x409976(_0x5c3593,_0x325f7b- -_0x32c88d._0xcf7e28);}setNav('nav-popular'),await renderGrid(_0x44000a,_0x2566ca(-0x29,_0x487b98._0x1cacb5)+_0x18be95);}async function renderGrid(_0x3c04c1,_0x5385e4){const _0x98d62e={_0x423a4e:'*gHM',_0xea5810:'bK$w',_0x155845:0x28c,_0x4a8e69:0x168,_0xca3520:0x148,_0x4a19a4:'fDPe',_0x4d8997:0x308,_0x86392e:'#eB1',_0x26d40c:'3Sz(',_0x79d48c:0x2ba,_0x1b5cd2:'29dG'},_0x40dd7d={_0x55c65d:0x1e8};function _0x4240c5(_0x1489e5,_0x580c74){return _0x3f3971(_0x1489e5-0x75,_0x580c74);}view[_0x4240c5(0x115,_0x98d62e._0x423a4e)]=skelGrid();function _0xe1b235(_0x56930a,_0x5a6377){return _0x3f3971(_0x5a6377-_0x40dd7d._0x55c65d,_0x56930a);}try{const _0x4c32f1=await api(_0x5385e4);view['innerHTML']=_0x4240c5(0x12c,_0x98d62e._0xea5810)+esc(_0x3c04c1)+_0xe1b235('y^Wp',_0x98d62e._0x155845)+_0x4c32f1[_0x4240c5(_0x98d62e._0x4a8e69,'29dG')](card)[_0x4240c5(_0x98d62e._0xca3520,_0x98d62e._0x4a19a4)]('')+_0xe1b235(_0x98d62e._0x4a19a4,_0x98d62e._0x4d8997);}catch(_0x40a8bf){view[_0x4240c5(0x16a,_0x98d62e._0x86392e)]=_0xe1b235(_0x98d62e._0x26d40c,_0x98d62e._0x79d48c)+esc(_0x40a8bf['message'])+_0xe1b235(_0x98d62e._0x1b5cd2,0x24f);}}async function doSearch(_0x50df46){const _0x4c4244={_0x7feccd:0x157,_0x34ec8b:0x6e,_0x13805c:'fiA3',_0x3d2396:0x65,_0x3ba1ac:0x58,_0x1a502e:0xae,_0x45909b:'E5fs',_0x41d158:0x101,_0x3fc885:'KnmC',_0xaf18fa:0xd0,_0x1afb83:'1rkn',_0x45405f:0x4d,_0x273d33:'!VRW',_0x2b92ae:'1LsU'},_0x5981bd={_0x40c9e2:0x5a};function _0xf1389b(_0x4336f7,_0x16bcd2){return _0x3f3971(_0x4336f7- -0x153,_0x16bcd2);}function _0x5791fa(_0x3fd524,_0x5431c4){return _0x3f3971(_0x3fd524- -_0x5981bd._0x40c9e2,_0x5431c4);}setNav(''),view[_0xf1389b(-_0x4c4244._0x7feccd,'$RRG')]=skelGrid();try{const _0x272dfd=await api(_0x5791fa(_0x4c4244._0x34ec8b,_0x4c4244._0x13805c)+encodeURIComponent(_0x50df46));view[_0x5791fa(-_0x4c4244._0x3d2396,'[5[d')]='<div\x20class=\x22section-title\x22>Results\x20for\x20\x22'+esc(_0x50df46)+_0x5791fa(-_0x4c4244._0x3ba1ac,'KjZq')+(_0x272dfd[_0xf1389b(-_0x4c4244._0x1a502e,_0x4c4244._0x45909b)]?_0x272dfd[_0xf1389b(-_0x4c4244._0x41d158,'CI&(')](card)['join'](''):_0xf1389b(-0x15c,_0x4c4244._0x3fc885))+_0xf1389b(-_0x4c4244._0xaf18fa,_0x4c4244._0x1afb83);}catch(_0x466f74){view['innerHTML']=_0x5791fa(-_0x4c4244._0x45405f,_0x4c4244._0x273d33)+esc(_0x466f74[_0xf1389b(-0x10c,_0x4c4244._0x2b92ae)])+_0xf1389b(-0x69,'KjZq');}}let curSeries=null;async function openSeries(_0x1faadd){const _0x21e0ca={_0x11aa99:'#eB1',_0x115f15:0x455,_0x4c025b:'&ekc',_0x4a0aa0:0x228,_0x35c433:0x4f1,_0x3611f7:'H(L^',_0x109ccd:0x3d6,_0x133b96:'$RRG',_0x131865:0x48c,_0x1d431b:'TmjW',_0x2d5b2e:'@XZS',_0x3c68cc:0x44f,_0x308849:0x177,_0x13b6fd:'3Sz(',_0x28f010:0x467,_0xb371ac:'fr3o',_0x379734:0x415,_0x3b22eb:0x448,_0x6ac217:0x469,_0x5b591c:'Q@t3',_0x258474:0x43b,_0x36582e:'y^Wp',_0x4b5091:'3Sz(',_0x28fc7c:0x241,_0x2efb1f:'3mNV',_0x2c613d:0x182,_0x4772fb:'T(U!',_0x24d341:0x268,_0x15c413:'8pSr',_0x5d1075:0x416,_0x24256f:0x227,_0x21a50c:'dF)o',_0x4a46dc:'ErGD',_0x2e47b8:0x1ab,_0x8659bf:'uf1Q',_0x1fa234:0x240,_0x1ca4b9:0x4da},_0x13a158={_0x2336c8:0x3da};function _0x21b2c8(_0x430cef,_0x4ae51f){return _0x3f3971(_0x430cef-_0x13a158._0x2336c8,_0x4ae51f);}window[_0x21b2c8(0x45b,_0x21e0ca._0x11aa99)](-0x20c9+-0x1c60+-0x33*-0x133,0x129c*0x1+0x15b*-0x3+-0xe8b),view[_0x21b2c8(0x3d2,'CI&(')]='<div\x20class=\x22loader\x22><i\x20class=\x22ri-loader-4-line\x22></i></div>';function _0x47fb87(_0x44e87c,_0x424506){return _0x3f3971(_0x44e87c-0x159,_0x424506);}try{const _0x2dcf9d=await api(_0x21b2c8(_0x21e0ca._0x115f15,_0x21e0ca._0x4c025b)+encodeURIComponent(_0x1faadd));curSeries=_0x2dcf9d;const _0xa4d966=_0x2dcf9d[_0x47fb87(_0x21e0ca._0x4a0aa0,'KnmC')]||[],_0x2be777=getProg(_0x1faadd),_0x5b0e11=new Set(_0x2be777?_0x2be777[_0x21b2c8(0x456,'s4Qf')]:[]),_0x1dce15=_0x2be777?_0x2be777['lastEp']:_0xa4d966[0x1*-0x1285+0x4*-0x43f+0x2381]&&_0xa4d966[-0x1c1d+-0x23f3+0x4010][_0x21b2c8(_0x21e0ca._0x35c433,_0x21e0ca._0x3611f7)];view[_0x21b2c8(_0x21e0ca._0x109ccd,_0x21e0ca._0x133b96)]=_0x21b2c8(_0x21e0ca._0x131865,_0x21e0ca._0x1d431b)+esc(_0x2dcf9d[_0x47fb87(0x190,_0x21e0ca._0x2d5b2e)])+_0x21b2c8(0x43f,'KjZq')+esc(_0x2dcf9d['poster'])+_0x47fb87(0x163,_0x21e0ca._0x11aa99)+esc(_0x2dcf9d[_0x21b2c8(_0x21e0ca._0x3c68cc,'%Ea5')])+_0x47fb87(_0x21e0ca._0x308849,_0x21e0ca._0x13b6fd)+(_0x2dcf9d[_0x21b2c8(_0x21e0ca._0x28f010,_0x21e0ca._0xb371ac)]?_0x21b2c8(_0x21e0ca._0x379734,'29dG')+esc(_0x2dcf9d[_0x47fb87(0x179,'E5fs')])+_0x21b2c8(_0x21e0ca._0x3b22eb,'29dG'):'')+_0x21b2c8(_0x21e0ca._0x6ac217,_0x21e0ca._0x5b591c)+_0xa4d966[_0x21b2c8(_0x21e0ca._0x258474,_0x21e0ca._0x36582e)]+_0x47fb87(0x233,'#eB1')+esc(_0x2dcf9d['description']||'')+_0x47fb87(0x15d,_0x21e0ca._0x4b5091)+(_0xa4d966[_0x47fb87(_0x21e0ca._0x28fc7c,'bK$w')]?_0x47fb87(0x1c5,_0x21e0ca._0x2efb1f)+esc(_0x1faadd)+'\x27,'+_0x1dce15+','+(!!_0x2be777&&!!_0x2be777[_0x47fb87(_0x21e0ca._0x2c613d,_0x21e0ca._0x4772fb)])+_0x47fb87(_0x21e0ca._0x24d341,_0x21e0ca._0x15c413)+(_0x2be777?_0x21b2c8(_0x21e0ca._0x5d1075,'Dv(D')+_0x2be777[_0x47fb87(_0x21e0ca._0x24256f,_0x21e0ca._0x21a50c)]:_0x47fb87(0x198,_0x21e0ca._0x4a46dc))+'</button></div>':'')+'\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</div>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</div>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22eps\x22>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<h3>Episodes</h3>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22ep-grid\x22>'+_0xa4d966[_0x47fb87(_0x21e0ca._0x2e47b8,'CI&(')](_0x51947f=>_0x21b2c8(0x496,'Dv(D')+(_0x5b0e11['has'](_0x51947f[_0x21b2c8(0x489,'b@F[')])?_0x21b2c8(0x43d,'T(U!'):'')+_0x47fb87(0x222,'b@F[')+esc(_0x1faadd)+'\x27,'+_0x51947f[_0x47fb87(0x24d,'yV3o')]+')\x22>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22n\x22>'+_0x51947f[_0x47fb87(0x202,'fDPe')]+_0x21b2c8(0x4a6,'dF)o')+esc(_0x51947f['title']||_0x47fb87(0x175,'zpPw')+_0x51947f[_0x47fb87(0x191,'#eB1')])+'</div>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22tags\x22>'+(_0x5b0e11[_0x21b2c8(0x4d7,'dF)o')](_0x51947f['number'])?_0x21b2c8(0x40c,'!VRW'):'')+(_0x51947f[_0x21b2c8(0x3ee,'Zbtq')]?_0x47fb87(0x17f,'xUiG'):'')+(_0x51947f[_0x21b2c8(0x422,'@1mX')]?_0x47fb87(0x236,'ZR%e'):'')+'</div>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</div>')[_0x21b2c8(0x3d0,_0x21e0ca._0x8659bf)]('')+_0x47fb87(_0x21e0ca._0x1fa234,'29dG');}catch(_0x72a40f){view['innerHTML']=_0x21b2c8(_0x21e0ca._0x1ca4b9,'&ekc')+esc(_0x72a40f[_0x21b2c8(0x459,'Ze%@')])+'</div>';}}const _0x553474={};_0x553474[_0x409976('*gHM',0x1ad)]=null,_0x553474['ep']=null,_0x553474[_0x3f3971(0x79,'KjZq')]=!(0x1c9c+-0x1*0x1f67+0xb3*0x4);let curWatch=_0x553474;async function watch(_0x1e10ac,_0x1f8989,_0x5d346a){const _0x3ca5ed={_0x16d9b7:0x1f7,_0x16308c:0x213,_0x22bd32:'KjZq',_0x1e423b:0x433,_0x4757d4:'pkpz',_0x20a7e2:'@XZS',_0x527d03:'Q@t3',_0x5e458a:0x14b,_0x5e52dd:'E5fs',_0x19cf65:0x1fc,_0x14cd8f:0x1f0,_0x58f286:0x508,_0x3cc826:'@XZS',_0x44a4cb:0x417,_0x4fb013:'%Ea5',_0x973f13:'TsGN'},_0x596b43={_0x268449:0x34e};if(window[_0x38fc76(_0x3ca5ed._0x16d9b7,'1LsU')](0xc78+0x211b+-0xf31*0x3,-0x1f*-0x6d+0x1*0x8ab+-0x15de),!curSeries||curSeries[_0x38fc76(_0x3ca5ed._0x16308c,_0x3ca5ed._0x22bd32)]!==_0x1e10ac)try{curSeries=await api(_0x38ae98(_0x3ca5ed._0x1e423b,_0x3ca5ed._0x4757d4)+encodeURIComponent(_0x1e10ac));}catch{}const _0x2109c2={};_0x2109c2['slug']=_0x1e10ac,_0x2109c2['ep']=_0x1f8989,_0x2109c2[_0x38ae98(0x480,_0x3ca5ed._0x20a7e2)]=!!_0x5d346a;function _0x38fc76(_0x48c059,_0x59028e){return _0x409976(_0x59028e,_0x48c059-0x5a);}function _0x38ae98(_0x4bf1d1,_0x5adf9e){return _0x409976(_0x5adf9e,_0x4bf1d1-_0x596b43._0x268449);}curWatch=_0x2109c2,markWatched(_0x1e10ac,_0x1f8989,_0x5d346a);const _0x25ef75=curSeries&&curSeries[_0x38ae98(0x50e,_0x3ca5ed._0x527d03)]||[],_0x4647e3=new Set((getProg(_0x1e10ac)||{})[_0x38fc76(_0x3ca5ed._0x5e458a,_0x3ca5ed._0x5e52dd)]||[]),_0x50d78d=curSeries?curSeries[_0x38fc76(_0x3ca5ed._0x19cf65,'y^Wp')]:_0x38fc76(_0x3ca5ed._0x14cd8f,'[5[d');view[_0x38ae98(_0x3ca5ed._0x58f286,_0x3ca5ed._0x3cc826)]='<div\x20class=\x22watch\x22>\x0a\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22player-wrap\x22>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22player-top\x22>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<button\x20class=\x22back\x22\x20onclick=\x22openSeries(\x27'+esc(_0x1e10ac)+_0x38ae98(_0x3ca5ed._0x44a4cb,'fiA3')+esc(_0x50d78d)+_0x38fc76(0x19e,'TsGN')+_0x1f8989+'</span>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<span\x20class=\x22grow\x22></span>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<div\x20class=\x22sd-toggle\x22>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<button\x20id=\x22sd-sub\x22\x20class=\x22'+(_0x5d346a?'':'on')+_0x38fc76(0x14d,_0x3ca5ed._0x4fb013)+esc(_0x1e10ac)+'\x27,'+_0x1f8989+',false)\x22>SUB</button>\x0a\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<button\x20id=\x22sd-dub\x22\x20class=\x22'+(_0x5d346a?'on':'')+'\x22\x20onclick=\x22watch(\x27'+esc(_0x1e10ac)+'\x27,'+_0x1f8989+_0x38ae98(0x4fc,_0x3ca5ed._0x973f13)+_0x25ef75[_0x38fc76(0x225,'1rkn')](_0xd9d55d=>_0x38ae98(0x446,'$RRG')+(_0xd9d55d[_0x38fc76(0x230,'cGGk')]===_0x1f8989?'on':'')+'\x20'+(_0x4647e3['has'](_0xd9d55d[_0x38fc76(0x14f,'29dG')])?_0x38ae98(0x515,'ZR%e'):'')+_0x38ae98(0x528,'xUiG')+esc(_0x1e10ac)+'\x27,'+_0xd9d55d[_0x38fc76(0x1da,'$RRG')]+','+!!_0x5d346a+_0x38fc76(0x199,'$RRG')+_0xd9d55d[_0x38ae98(0x448,'#eB1')]+'</span><span\x20class=\x22t\x22>'+esc(_0xd9d55d['title']||_0x38fc76(0x212,'&ekc')+_0xd9d55d[_0x38ae98(0x49e,'ErGD')])+_0x38ae98(0x449,'b@F[')+(_0x4647e3['has'](_0xd9d55d['number'])?_0x38ae98(0x516,'3mNV'):'')+'</div>')['join']('')+'\x0a\x20\x20\x20\x20\x20\x20\x20\x20</div>\x0a\x20\x20\x20\x20</div>',loadStream(_0x1e10ac,_0x1f8989,_0x5d346a);}function _0x3f3971(_0x429c75,_0x623a56){const _0x129bc4={_0x3b70a1:0xf2};return _0x4e47(_0x429c75- -_0x129bc4._0x3b70a1,_0x623a56);}let _asFb=null;async function loadStream(_0x2033a3,_0x449471,_0x464957){const _0x336487={_0x5d99e4:'3Sz(',_0x66430a:0x3ec,_0x167b34:0x408,_0x5f0ae2:'*gHM',_0x1fed62:'dF)o',_0x25e648:0x327,_0xc1c919:'@1mX',_0x4fdb25:0x421,_0xc06d5b:0x373,_0x271c48:'@1mX',_0x3ec90d:0x35c,_0x51ed7a:0x3fc,_0x40a120:'s4Qf',_0x15a22f:0x3b6,_0x5984f6:'TsGN',_0x365d95:0x305,_0x1a9621:0x435},_0x5d6dbb={_0x53a2c1:0xd2,_0x45c7bc:'8pSr',_0x6b5fcd:'h9&)',_0x3248a3:0x15d,_0x53569d:'[2K6',_0x52ea82:0x25d,_0x183486:0xe0,_0x42e1d9:0xdd,_0x1e0f33:'Ze%@',_0x22221c:0x24a,_0x222fec:'ErGD',_0x4788a7:0x141,_0x3e41ce:'@XZS',_0x629fef:0xac,_0x19d81a:'Dv(D'},_0x569bbd={_0xba4075:'&ekc',_0x198c9b:0x167},_0x2869e7={_0x251648:0x8d},_0x214915={_0x4d0639:0x1cf},_0x2c111c={_0x444a41:'fr3o'},_0x439ef6={_0x180a75:0x4a1};function _0x45bd7d(_0x257f28,_0x3e13bd){return _0x409976(_0x257f28,_0x3e13bd-0x2f5);}const _0x214105=document[_0x4bde62(_0x336487._0x5d99e4,0x341)](_0x45bd7d('zpPw',0x4c2)),_0x29bdd4=document[_0x45bd7d('@1mX',_0x336487._0x66430a)](_0x45bd7d('ErGD',_0x336487._0x167b34)),_0x2dc1c2=document[_0x45bd7d(_0x336487._0x5f0ae2,0x405)](_0x4bde62(_0x336487._0x1fed62,0x3b6)),_0xc45972=_0x352aef=>{function _0x20bc90(_0xb11eeb,_0x3c4f12){return _0x45bd7d(_0xb11eeb,_0x3c4f12- -0x2f);}function _0x3bde71(_0x1a67a1,_0x2e7b13){return _0x45bd7d(_0x2e7b13,_0x1a67a1- -_0x439ef6._0x180a75);}_0x29bdd4&&(_0x29bdd4[_0x20bc90(_0x2c111c._0x444a41,0x3c8)][_0x20bc90('H(L^',0x3e3)]=_0x3bde71(-0xa1,'KjZq'),_0x29bdd4[_0x20bc90('KjZq',0x471)]='<i\x20class=\x22ri-error-warning-line\x22\x20style=\x22animation:none;color:var(--dim)\x22></i><span>'+esc(_0x352aef)+'</span>');};function _0x4bde62(_0x2fccab,_0x1bd2a9){return _0x409976(_0x2fccab,_0x1bd2a9-_0x214915._0x4d0639);}_asFb&&_asFb['cancel']&&_asFb[_0x4bde62('T(U!',_0x336487._0x25e648)]();let _0x3984c3=null,_0x570deb=!(0x24b3+-0x5a1+-0xb*0x2d3),_0x247397=-0x10f*0x1+0xb8*0x11+-0xb29*0x1,_0x9df8b7=[];const _0x448034=()=>{_0x3984c3&&(clearTimeout(_0x3984c3),_0x3984c3=null);},_0x4f0a0a=async(_0x4faa6b,_0x2853ee)=>{const _0x29674f={_0x9a16a8:'1rkn'},_0xb48074={_0x132ced:0xb5,_0x32cb9c:'$RRG',_0x5b0b03:'[2K6',_0x4b8cf4:0x82,_0x4095d2:0x96,_0x6b1670:'ErGD'},_0x1d07f0={_0x204549:0x158},_0x1ac75d={_0xf69dc1:'CI&(',_0x58efc4:'[5[d',_0x2a1fa0:0x18d},_0x3c6daa={_0x3ad0f4:0x21c},_0x454ab6={_0x248f3b:0x213};function _0x47d570(_0x40ec57,_0x3eeb29){return _0x4bde62(_0x3eeb29,_0x40ec57- -_0x2869e7._0x251648);}function _0x114cad(_0x51f067,_0x4436ff){return _0x4bde62(_0x4436ff,_0x51f067- -_0x454ab6._0x248f3b);}var _0xedc377,_0x22a651;_0x448034(),_0x570deb=!(-0x1d36+-0xbef+-0x1493*-0x2),_0x247397=_0x4faa6b,_0x4faa6b<-0x1c5*0xe+-0x1d93+-0x3659*-0x1||_0x4faa6b>=_0x9df8b7[_0x114cad(_0x5d6dbb._0x53a2c1,_0x5d6dbb._0x45c7bc)]?_0x2853ee&&_0xc45972(_0x47d570(0x326,_0x5d6dbb._0x6b5fcd)):((_0x1a51c5=>{function _0x4ca087(_0x3c44fb,_0x56c9da){return _0x114cad(_0x3c44fb-0x2e,_0x56c9da);}function _0x4448dd(_0x13abc0,_0x11973b){return _0x114cad(_0x11973b- -_0x3c6daa._0x3ad0f4,_0x13abc0);}_0x2dc1c2&&_0x2dc1c2[_0x4448dd(_0x1ac75d._0xf69dc1,-0xbd)](_0x4ca087(0x1c9,_0x1ac75d._0x58efc4))[_0x4448dd('3mNV',-_0x1ac75d._0x2a1fa0)](_0x463a60=>_0x463a60[_0x4ca087(0x160,'pkpz')][_0x4448dd('**X$',-0x114)]('on',+_0x463a60[_0x4448dd('29dG',-0xb8)]['i']===_0x1a51c5));})(_0x4faa6b),_0xedc377=await(async _0x50e4a1=>{function _0x3caf30(_0x4a90e2,_0x24f988){return _0x114cad(_0x24f988- -_0x1d07f0._0x204549,_0x4a90e2);}if(_0x4ff443(-_0xb48074._0x132ced,'1rkn')===_0x50e4a1[_0x3caf30(_0xb48074._0x32cb9c,-0xc1)]&&_0x50e4a1[_0x3caf30(_0xb48074._0x5b0b03,-_0xb48074._0x4b8cf4)]){for(let _0x585596=0xfdd+0x4*-0x2e4+-0x44d;_0x585596<0xbcc+0x78*0x23+0x2*-0xe06&&!proxyReady;_0x585596++)await new Promise(_0x3dfa35=>setTimeout(_0x3dfa35,0x35*0x1+-0x5a2+-0x1*-0x5d1));if(proxyReady&&sjController)try{return _sjEncode(_0x50e4a1[_0x4ff443(-_0xb48074._0x4095d2,'(5$z')]);}catch{}}function _0x4ff443(_0x25bb41,_0x114b62){return _0x114cad(_0x25bb41- -0x160,_0x114b62);}return _0x50e4a1[_0x3caf30(_0xb48074._0x6b1670,0x18)]||_0x50e4a1['url'];})(_0x9df8b7[_0x4faa6b]),_0x29bdd4&&(_0x29bdd4[_0x114cad(_0x5d6dbb._0x3248a3,_0x5d6dbb._0x53569d)][_0x114cad(0x12a,'y^Wp')]=_0x47d570(_0x5d6dbb._0x52ea82,'%Ea5'),_0x29bdd4[_0x114cad(_0x5d6dbb._0x183486,'&ekc')]=_0x47d570(0x230,'29dG')),_0x214105[_0x114cad(_0x5d6dbb._0x42e1d9,_0x5d6dbb._0x1e0f33)]=_0xedc377,_0x214105[_0x47d570(_0x5d6dbb._0x22221c,_0x5d6dbb._0x222fec)]=()=>{const _0x588e22={_0x8da34e:0x3f4};function _0x493fc1(_0x5e1b39,_0x537a56){return _0x47d570(_0x537a56- -_0x588e22._0x8da34e,_0x5e1b39);}function _0x297b0d(_0x56481e,_0x4f37d1){return _0x47d570(_0x4f37d1- -0x241,_0x56481e);}_0x29bdd4&&(_0x29bdd4[_0x493fc1(_0x569bbd._0xba4075,-_0x569bbd._0x198c9b)][_0x297b0d('$RRG',0x1a)]=_0x493fc1('TmjW',-0x12b));},setTimeout(()=>{function _0x2000fb(_0x16f757,_0x3f5c8b){return _0x47d570(_0x3f5c8b-0x134,_0x16f757);}function _0x25a90b(_0x476a06,_0x3a3c3b){return _0x47d570(_0x476a06- -0x136,_0x3a3c3b);}_0x29bdd4&&(_0x29bdd4[_0x25a90b(0x155,'Ze%@')][_0x25a90b(0x17f,'2B7M')]=_0x2000fb(_0x29674f._0x9a16a8,0x379));},0x186d+0x56*0x3b+-0x2087),!(_0x22a651=_0x9df8b7[_0x4faa6b])||_0x114cad(_0x5d6dbb._0x4788a7,_0x5d6dbb._0x3e41ce)!==_0x22a651['origin']&&_0x114cad(_0x5d6dbb._0x629fef,'bK$w')!==_0x22a651[_0x47d570(0x322,'CI&(')]&&_0x47d570(0x213,_0x5d6dbb._0x19d81a)!==_0x22a651[_0x47d570(0x28f,'T(U!')]||(_0x3984c3=setTimeout(()=>{_0x570deb||_0x4f0a0a(_0x4faa6b+(0x19c*0x17+0x1e45+-0x4348),!(-0x94*0x4+-0x1689+0x18d9));},-0x13de+-0x77b7*-0x1+-0x2559)));};_asFb={'ok':()=>{_0x570deb=!(0x2268+-0x1*0x3fa+-0x1e6e),_0x448034();},'fail':()=>{_0x448034(),_0x570deb||_0x4f0a0a(_0x247397+(-0x5*0x24b+-0xdd1+0x1949),!(-0x40d*-0x1+0xcd4+-0x1*0x10e1));},'cancel':()=>_0x448034()};try{const _0xfa0857=await api(_0x45bd7d(_0x336487._0xc1c919,_0x336487._0x4fdb25)+encodeURIComponent(_0x2033a3)+'/'+_0x449471+(_0x464957?_0x45bd7d('fiA3',0x47b):''));if(_0x9df8b7=(_0xfa0857[_0x4bde62('Ze%@',_0x336487._0xc06d5b)]||[])['filter'](_0x13ee5a=>_0x13ee5a&&(_0x13ee5a[_0x4bde62('CI&(',0x307)]||_0x13ee5a['url'])),!_0x9df8b7['length'])return _0xc45972(_0x464957?_0x4bde62('!VRW',0x3a4):_0x4bde62(_0x336487._0x271c48,_0x336487._0x3ec90d));_0x2dc1c2&&(_0x2dc1c2['innerHTML']=_0x9df8b7[_0x45bd7d('h9&)',_0x336487._0x51ed7a)]>0x2*0x974+-0x309+-0xfde?_0x45bd7d(_0x336487._0x40a120,_0x336487._0x15a22f)+_0x9df8b7['map']((_0x30d5df,_0x11c032)=>'<button\x20class=\x22srv-btn'+(0x23e5+0x16a2*0x1+-0x3a87===_0x11c032?_0x4bde62('*gHM',0x2a6):'')+_0x4bde62('s4Qf',0x294)+_0x11c032+'\x22>'+esc(_0x30d5df[_0x4bde62('KjZq',0x291)]||_0x4bde62('8pSr',0x2db)+(_0x11c032+(-0x105c*0x2+0x16a*-0x2+-0x1df*-0x13)))+_0x45bd7d('T(U!',0x454))['join'](''):'',_0x2dc1c2[_0x4bde62('Dv(D',0x2b9)]('.srv-btn')[_0x4bde62(_0x336487._0x5984f6,_0x336487._0x365d95)](_0x1a3902=>_0x1a3902['onclick']=()=>_0x4f0a0a(+_0x1a3902[_0x4bde62('fDPe',0x3a1)]['i'],!(-0xc5*0x17+0x7b*0x42+-0xe02)))),_0x4f0a0a(0x1566+-0x17d7+-0x19*-0x19,!(-0x1*-0x1add+0x7f*0x34+-0x2*0x1a54));}catch(_0xe6f2c0){_0xc45972(_0x45bd7d('TmjW',_0x336487._0x1a9621)+_0xe6f2c0[_0x4bde62('KjZq',0x2d5)]);}}window[_0x409976('pkpz',0x135)](_0x3f3971(-0x5,'bK$w'),_0x247c56=>{const _0xfd2220={_0x10029e:'#eB1',_0x5540ae:0x44,_0x3ef8dc:'dF)o',_0x2307a4:'zpPw',_0x1e3ba6:0xda,_0x414467:'3Sz(',_0x37eeac:0x6c,_0x4f7cbb:'ErGD',_0x341543:0xa2},_0x10da01={_0x30f3ce:0x52},_0xa41630=_0x247c56[_0x5d8dc7(-0x64,_0xfd2220._0x10029e)];function _0x5d8dc7(_0xedfee8,_0x181b50){return _0x3f3971(_0xedfee8- -0x69,_0x181b50);}function _0x116016(_0x50fd6a,_0x4ddc54){return _0x3f3971(_0x4ddc54-_0x10da01._0x30f3ce,_0x50fd6a);}_0xa41630&&_asFb&&(_0x5d8dc7(_0xfd2220._0x5540ae,_0xfd2220._0x3ef8dc)===_0xa41630[_0x116016('TmjW',0x107)]?_asFb['ok']():_0x116016(_0xfd2220._0x2307a4,_0xfd2220._0x1e3ba6)===_0xa41630[_0x116016(_0xfd2220._0x414467,_0xfd2220._0x37eeac)]&&_asFb[_0x116016(_0xfd2220._0x4f7cbb,_0xfd2220._0x341543)]());});const _qEl=document['getElementById']('q');_qEl[_0x3f3971(0xd8,'$RRG')](_0x409976('y^Wp',0xec),_0x368f9c=>{const _0x5ceda1={_0x41b84e:0x2ae};function _0x5918fa(_0x50754a,_0x340f7c){return _0x3f3971(_0x50754a- -_0x5ceda1._0x41b84e,_0x340f7c);}_0x368f9c[_0x5918fa(-0x22e,'TmjW')]['value']['trim']()||goHome();}),_qEl['addEventListener']('keydown',_0x3e11d8=>{const _0x259da4={_0x5d1215:0x151,_0x32d458:'fr3o',_0x5522f4:'**X$',_0x4b2383:0x17a,_0xa569c0:'@XZS'},_0x55cf5f={_0x126f90:0xe8};if(_0x5e0fe0(_0x259da4._0x5d1215,_0x259da4._0x32d458)!==_0x3e11d8[_0x5e0fe0(0x1b5,_0x259da4._0x5522f4)])return;const _0x38894d=_0x3e11d8[_0x5e0fe0(_0x259da4._0x4b2383,'ErGD')]['value'][_0x3d5f14(_0x259da4._0xa569c0,0x2c1)]();function _0x3d5f14(_0x10fd6b,_0x12122c){return _0x3f3971(_0x12122c-0x264,_0x10fd6b);}function _0x5e0fe0(_0x6b03d7,_0x2ed2f3){return _0x3f3971(_0x6b03d7-_0x55cf5f._0x126f90,_0x2ed2f3);}_0x38894d?doSearch(_0x38894d):goHome();}),window[_0x3f3971(0xe5,'#eB1')]('message',_0x381acb=>{const _0x5c4acb={_0x330aa4:'(5$z',_0x397aee:0x1c9,_0x4e8825:'pkpz',_0xe86e28:0xde,_0x514751:'8pSr',_0x4dd111:0x1bc,_0x3c5249:'TsGN',_0x60ad4a:0xb6,_0x380220:'xUiG'};function _0x383372(_0x16b1fe,_0x727810){return _0x3f3971(_0x16b1fe- -0x1d9,_0x727810);}function _0x4d147b(_0xc53b36,_0x28c74b){return _0x3f3971(_0x28c74b-0x4d9,_0xc53b36);}const _0x26b6bc=_0x381acb[_0x383372(-0x1a9,'3mNV')];if(_0x26b6bc&&_0x383372(-0xdd,_0x5c4acb._0x330aa4)===_0x26b6bc[_0x383372(-_0x5c4acb._0x397aee,_0x5c4acb._0x4e8825)]&&_0x383372(-_0x5c4acb._0xe86e28,_0x5c4acb._0x514751)===_0x26b6bc['intent']&&_0x26b6bc[_0x383372(-_0x5c4acb._0x4dd111,_0x5c4acb._0x3c5249)])try{openSeries(_0x26b6bc['slug']);}catch(_0x2e9b53){console[_0x383372(-_0x5c4acb._0x60ad4a,_0x5c4acb._0x380220)]('[anime\x20deeplink]',_0x2e9b53);}}),goHome(),loadProgress()[_0x409976('Q@t3',0x199)](()=>{const _0x25834b={_0x5993fc:'CI&('},_0x2cc71f={_0x16b91b:0x2a7},_0x535793={_0x3991ff:0x10c};function _0x4b0e96(_0x3521ea,_0x477132){return _0x409976(_0x3521ea,_0x477132-_0x535793._0x3991ff);}function _0xb00bcb(_0x317e5c,_0x5a1c72){return _0x409976(_0x317e5c,_0x5a1c72-_0x2cc71f._0x16b91b);}document[_0x4b0e96(_0x25834b._0x5993fc,0x2df)](_0xb00bcb('1rkn',0x40a))?.[_0x4b0e96('#eB1',0x246)]['contains']('on')&&goHome();});</script>
+
+
+</body></html>
