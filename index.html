@@ -503,6 +503,66 @@ button, input { border-radius: 0 !important; }
     }
   }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
   document.addEventListener('DOMContentLoaded', function () { sweep(document.body || document.documentElement); });
+
+  /* do not abandon a working stream --------------------------------------------
+   * the watch page arms a 16000 ms timer that advances to the next server when
+   * the player has not reported success. through the proxy a player needs far
+   * longer than 16 s to boot (scramjet + wisp + the stream manifest), so this
+   * timer was killing perfectly good streams mid-start and the site jumped
+   * HD -> HD2 -> HD3 -> Server 1 forever.
+   *
+   * stretch that one delay to 60 s, and when it fires, advance only if the
+   * player in the frame tree really is not playing. if a video exists but is
+   * still loading, give it one more 20 s window before giving up, so dead
+   * sources still fail over. every other timeout is untouched. */
+  var nativeSetTimeout = window.setTimeout;
+  function walkFrames(fn) {
+    var done = false;
+    (function visit(doc, depth) {
+      if (done || depth > 6) return;
+      try { if (fn(doc) === false) { done = true; return; } } catch (e) {}
+      var frames;
+      try { frames = doc.querySelectorAll('iframe'); } catch (e) { return; }
+      for (var i = 0; i < frames.length; i++) {
+        try { if (frames[i].contentDocument) visit(frames[i].contentDocument, depth + 1); } catch (e) {}
+      }
+    })(document, 0);
+  }
+  function isPlaying() {
+    var playing = false;
+    walkFrames(function (doc) {
+      var vs = doc.querySelectorAll('video');
+      for (var i = 0; i < vs.length; i++) {
+        var v = vs[i];
+        if (v.error) continue;
+        if (v.currentTime > 0.5 || (!v.paused && v.readyState >= 2)) { playing = true; return false; }
+      }
+    });
+    return playing;
+  }
+  function loadingVideo() {
+    var v = null;
+    walkFrames(function (doc) {
+      var vs = doc.querySelectorAll('video');
+      if (vs.length) { v = vs[vs.length - 1]; return false; }
+    });
+    return v && !v.error && v.readyState < 2 ? v : null;
+  }
+  window.setTimeout = function (fn, delay) {
+    if (delay !== 16000 || typeof fn !== 'function') return nativeSetTimeout.apply(window, arguments);
+    var args = Array.prototype.slice.call(arguments, 2);
+    var retried = false;
+    function fire() {
+      if (isPlaying()) return;                 // stream is running: never switch away
+      if (!retried && loadingVideo()) {        // still buffering: one more window
+        retried = true;
+        nativeSetTimeout.call(window, fire, 20000);
+        return;
+      }
+      fn.apply(window, args);
+    }
+    return nativeSetTimeout.call(window, fire, 60000);
+  };
 })();
 </script>
 </head>
