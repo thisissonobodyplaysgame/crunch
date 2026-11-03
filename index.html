@@ -464,6 +464,47 @@ button, input { border-radius: 0 !important; }
 .ep.watched .n, .ep .tags .seen { background: rgba(255,255,255,0.08); color: var(--dim); }
 .loader i { color: #fff; }
 </style>
+<script>
+/* keep watch-page players reachable from filtered networks ---------------------
+ * the player is an <iframe> on a third-party stream host. loaded directly it can
+ * be blocked by a school filter, so every external frame is pointed at the same
+ * leskid proxy the movie site uses. same-origin frames (app modules) are left
+ * alone, and frames the site already proxied are never wrapped twice.
+ *
+ * the redirect goes through srcdoc, not src: this page's loader rewrites any
+ * same-host src to its own mirror, so setting src to a proxy url would be
+ * rewritten back - and wrapping that again nested frames until the tab hung. */
+(function () {
+  var PROXY = 'https://thisissonobodyplaysgame.github.io/leskid/?url=';
+  function isExternal(u) {
+    if (typeof u !== 'string' || !u) return false;
+    if (u.indexOf(PROXY) === 0 || u.indexOf('/leskid/?url=') !== -1) return false;   // already proxied
+    try {
+      var x = new URL(u, location.href);
+      return (x.protocol === 'http:' || x.protocol === 'https:') && x.host !== location.host;
+    } catch (e) { return false; }
+  }
+  function redirect(f) {
+    var s = f.getAttribute('src');
+    if (!isExternal(s)) return;
+    f.srcdoc = '<meta http-equiv="refresh" content="0;url=' + (PROXY + encodeURIComponent(s)).replace(/"/g, '%22') + '">';
+  }
+  function sweep(root) {
+    if (!root || root.nodeType !== 1) return;
+    if (root.tagName === 'IFRAME') return redirect(root);
+    var list = root.querySelectorAll ? root.querySelectorAll('iframe') : [];
+    for (var i = 0; i < list.length; i++) redirect(list[i]);
+  }
+  new MutationObserver(function (ms) {
+    for (var i = 0; i < ms.length; i++) {
+      var m = ms[i];
+      if (m.type === 'attributes') redirect(m.target);
+      else if (m.addedNodes) for (var j = 0; j < m.addedNodes.length; j++) sweep(m.addedNodes[j]);
+    }
+  }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+  document.addEventListener('DOMContentLoaded', function () { sweep(document.body || document.documentElement); });
+})();
+</script>
 </head>
 <body>
 <div class="topbar">
